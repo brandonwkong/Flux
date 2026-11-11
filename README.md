@@ -1,6 +1,6 @@
 # Flux
 
-A distributed ML inference platform with dynamic batching, GPU-aware scheduling, and bin-packing placement.
+A ML inference platform with dynamic batching and GPU-aware scheduling, working on kernel level optimizations next
 
 ## Architecture
 
