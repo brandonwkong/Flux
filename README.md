@@ -213,19 +213,6 @@ flux/
 - [ ] Autoscaling
 - [ ] Load testing + benchmarks
 
-## Benchmark Targets
-
-| Metric | Target |
-|--------|--------|
-| Latency p50 | <10ms |
-| Latency p99 | <50ms |
-| Throughput | 10K req/sec |
-| GPU Utilization | >80% |
-| Cold start | <5s |
-
-## Resume Bullet
-
-> Built a distributed ML inference platform with dynamic batching, GPU-aware scheduling, and bin-packing placement — achieving 10K req/sec at <20ms p99 latency with full Prometheus/Grafana observability
 
 ## Tech Stack
 
