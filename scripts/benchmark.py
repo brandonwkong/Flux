@@ -41,7 +41,7 @@ from typing import Optional
 
 import httpx
 
-SERVER_URL = "http://localhost:8000"
+SERVER_URL = "http://127.0.0.1:8000"  # not "localhost": Windows httpx tries ::1 first and stalls ~2s before IPv4 fallback
 STARTUP_TIMEOUT_S = 180.0  # TinyLlama load + first-run HF download can take a while
 
 
