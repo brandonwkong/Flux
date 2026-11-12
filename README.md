@@ -1,337 +1,176 @@
 # Flux
 
-An ML inference serving platform: dynamic batching, model-aware worker routing, and a
-central scheduler orchestrating horizontally-scalable worker nodes over HTTP.
+A single-process LLM inference runtime, built to learn inference-runtime engineering —
+batching, scheduling, KV cache — and eventually kernel-level optimization. Not a
+platform: one process, one model (TinyLlama-1.1B), one GPU.
 
 ## Architecture
 
 ```
-POST /predict
+POST /generate
       │
       ▼
-┌──────────────────────────────────────────────────────────────┐
-│                             FLUX                             │
-│                                                              │
-│         ┌─────────┐    ┌─────────┐    ┌───────────┐          │
-│         │   API   │───►│ Batcher │───►│ Scheduler │          │
-│         └─────────┘    └─────────┘    └─────┬─────┘          │
-│                                                              │
-│      Collects requests into batches                          │
-│      (max 32, or 10ms wait) then routes to best worker       │
-│                                                              │
-│      ┌───────────────────┼───────────────────┐               │
-│      ▼                   ▼                   ▼               │
-│      ┌──────────┐       ┌──────────┐      ┌──────────┐       │
-│      │ Worker 1 │       │ Worker 2 │      │ Worker 3 │       │
-│      │ [resnet] │       │ [bert]   │      │ [resnet] │       │
-│      │   ONNX   │       │   ONNX   │      │   ONNX   │       │
-│      └──────────┘       └──────────┘      └──────────┘       │
-│           │                   │                  │           │
-│           └───────────────────┴──────────────────┘           │
-│                                                              │
-│                   ┌───────▼───────┐                          │
-│                   │    Metrics    │                          │
-│                   │ latency, tput │──► Grafana               │
-│                   └───────────────┘                          │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                            FLUX                              │
+│                                                               │
+│   RequestQueue                Engine                         │
+│   ┌──────────────┐    pick    ┌──────────────────────────┐   │
+│   │ req ─ Future  │◄──next────│ scheduler.select_batch()  │   │
+│   │ req ─ Future  │   batch   │  FIFO / PRIORITY / EDF    │   │
+│   │ req ─ Future  │           │           │               │   │
+│   └──────────────┘           │           ▼               │   │
+│                               │   one padded forward pass │   │
+│                               │   through TinyLlama (GPU) │   │
+│                               └──────────────┬─────────────┘   │
+│                                              │                 │
+│                               resolves each Future with        │
+│                               text + queue_time_ms +            │
+│                               compute_time_ms + batch_size      │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-This is a centralized scheduler / distributed worker-pool architecture — one coordinator
-dispatching to independently-scaling worker processes over HTTP (same shape as Celery or
-a Kubernetes control plane + kubelets), not a leaderless/replicated system: the scheduler
-itself is a single in-memory process with no HA today. See
-[Known Limitations](#known-limitations).
+Two concerns kept deliberately separate:
 
-## Key Features
+- **Scheduling** (`scheduler.py`) decides *which* pending requests get pulled into the
+  next batch, given more are waiting than fit. Swappable at process start: FIFO, PRIORITY
+  (highest priority first, FIFO tie-break), EDF (earliest absolute deadline first).
+- **Batching** (`engine.py`) decides *how many* requests run together in one GPU forward
+  pass, and lives inside the engine's own loop — not a separate pre-worker stage.
 
-| Feature | Description |
-|---------|-------------|
-| **Dynamic Batching** | Collects requests into batches for GPU efficiency (max 32 or 10ms) |
-| **Model-Aware Routing** | Prefers workers with the model already loaded (warm); falls back to the worker with the most free GPU memory on a cold start |
-| **Backpressure** | Rejects requests with 503 when the batcher queue is full |
-| **Heartbeat-Based Failure Detection** | Workers that miss heartbeats are marked unhealthy and removed from routing |
-| **Observability** | Prometheus metrics; Grafana datasource auto-provisioned via Docker Compose |
-
-> A separate, legacy generic job-scheduling API (`/jobs`) also lives in this codebase —
-> priority queue with aging, preemption, and real best-fit bin-packing placement. It
-> predates the inference pipeline and is unrelated to `/predict`. See
-> [Legacy Job API](#legacy-job-api) below.
+Each request gets an `asyncio.Future` the instant it's enqueued (`queue.py`); the HTTP
+handler just awaits it. Whether the engine ran that request alone, first, last, or
+batched with five others is invisible to the caller.
 
 ## Quick Start
-
-### Local Development
 
 ```bash
 cd flux
 pip install -e ".[dev]"
 
-# Terminal 1: Start API server
-python -m flux.api.main
-
-# Terminal 2: Start a worker
-python -m flux.worker.main
-
-# Terminal 3: Send a prediction request
-curl -X POST http://localhost:8000/predict \
-  -H "Content-Type: application/json" \
-  -d '{"model": "resnet50", "inputs": [[1.0, 2.0, 3.0]]}'
+python -m flux.server
 ```
-
-No ONNX model files are required to run this — if `models/<name>.onnx` doesn't exist (or
-`onnxruntime` isn't installed), the worker transparently falls back to mock inference so
-the full pipeline (batching → routing → dispatch) is exercisable without real weights.
-
-### Docker Compose
 
 ```bash
-docker-compose up --build
-
-# Access:
-# - API: http://localhost:8000
-# - Prometheus: http://localhost:9090
-# - Grafana: http://localhost:3000 (Prometheus datasource pre-provisioned; build your own panels)
+curl -X POST http://127.0.0.1:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "The capital of France is", "max_new_tokens": 16}'
+# {"text": "Paris.\n...", "queue_time_ms": 26.5, "compute_time_ms": 495.5, "batch_size": 1}
 ```
+
+Use `127.0.0.1`, not `localhost` — on Windows, httpx tries IPv6 (`::1`) first and stalls
+~2s before falling back to IPv4.
 
 ## API
 
-### Inference
-
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/predict` | Submit inference request (sync) |
-| GET | `/models` | List available models |
-| GET | `/models/{name}` | Get model info |
-
-### Workers
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/workers` | Register a worker |
-| GET | `/workers` | List workers |
-| POST | `/workers/{id}/heartbeat` | Worker heartbeat |
-| POST | `/workers/{id}/drain` | Drain worker |
-
-### Monitoring
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
+| POST | `/generate` | Submit a prompt, block until the engine returns text + timing |
 | GET | `/health` | Health check |
-| GET | `/stats` | System statistics |
-| GET | `/metrics` | Prometheus metrics |
+| GET | `/stats` | Queue depth, active policy, model, device |
 
-### Legacy Job API
+`GenerateRequest`: `prompt`, `max_new_tokens`, `priority` (read by the PRIORITY policy),
+`deadline_ms` (read by the EDF policy).
 
-`/jobs`, `/workers/{id}/execute` (via worker's `/execute`), `/callbacks/completed|failed` —
-a generic "submit a shell command, schedule it with priority + preemption + bin-packing"
-API, independent of the inference path above. Kept for compatibility; not exercised by
-`/predict`.
-
-## Example Usage
-
-```python
-import httpx
-
-# Single prediction
-response = httpx.post("http://localhost:8000/predict", json={
-    "model": "resnet50",
-    "inputs": [[0.1, 0.2, 0.3, ...]]  # Your input tensor
-})
-print(response.json())
-# {"predictions": [293], "latency_ms": 12.5, "batch_size": 1, "model": "resnet50"}
-
-# Batch prediction
-response = httpx.post("http://localhost:8000/predict", json={
-    "model": "resnet50",
-    "inputs": [
-        [0.1, 0.2, ...],
-        [0.3, 0.4, ...],
-        [0.5, 0.6, ...]
-    ]
-})
-print(response.json())
-# {"predictions": [293, 151, 7], "latency_ms": 15.2, "batch_size": 3, "model": "resnet50"}
-```
-
-(Predictions are class indices for image-ish model names, mock embeddings for
-text/bert-ish names, or input length otherwise — see `worker/executor.py`'s mock mode.)
+`GenerateResponse`: `text`, `queue_time_ms` (time spent waiting before this request's
+batch started), `compute_time_ms` (wall-clock time of the shared forward pass — the same
+value for every request in that batch, since that's literally how much GPU time they
+shared), `batch_size`.
 
 ## Configuration
 
 | Environment Variable | Default | Description |
-|---------------------|---------|-------------|
-| `MAX_BATCH_SIZE` | 32 | Maximum requests per batch |
-| `BATCH_TIMEOUT_MS` | 10 | Max wait time to form batch |
-| `MAX_QUEUE_DEPTH` | 1000 | Backpressure threshold |
-| `WORKER_TIMEOUT_S` | 30 | Worker heartbeat timeout before marked unhealthy |
+|---|---|---|
+| `FLUX_MODEL` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | HF model id |
+| `MAX_BATCH_SIZE` | 8 | Max requests per forward pass |
+| `MAX_WAIT_MS` | 20 | How long the engine waits for stragglers to join a forming batch |
+| `MAX_QUEUE_DEPTH` | 1000 | Backpressure threshold (503 past this) |
+| `SCHEDULING_POLICY` | `fifo` | `fifo` \| `priority` \| `edf` — **read once at startup** |
 
-## Metrics
+Changing `SCHEDULING_POLICY` means restarting the process, same as changing the model.
 
-Primary (inference path):
+## Benchmarking
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `flux_request_latency_seconds` | Histogram | End-to-end `/predict` latency |
-| `flux_requests_total` | Counter | Total requests by model/status |
-| `flux_batch_size` | Histogram | Batch size distribution |
-| `flux_batch_wait_ms` | Histogram | Time requests wait for batching |
-| `flux_batcher_queue_depth` | Gauge | Pending requests per model, in the batcher |
-| `flux_worker_inference_latency_seconds` | Histogram | Worker-side inference latency |
-| `flux_worker_model_load_seconds` | Histogram | Model load time on worker |
+`scripts/benchmark.py` is a first-class part of this project, not an afterthought: it
+answers "how does each scheduling policy actually behave under concurrent load,"
+honestly, against the real model.
 
-Legacy job scheduler (not used by `/predict`):
+```bash
+# Default sweep: 3 policies x 5 concurrency levels, one command.
+python scripts/benchmark.py --output results.csv
+```
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `flux_queue_depth` | Gauge | Pending legacy jobs |
-| `flux_cluster_utilization` | Gauge | Declared resource utilization across workers (allocated ÷ capacity, not live GPU telemetry) |
+Since the policy is fixed at startup, the script manages the server itself — restarting
+it once per policy (reusing that one process across all of that policy's concurrency
+levels) and writing one row per (policy, concurrency) combination: latency percentiles,
+throughput, and the average queue-time/compute-time split pulled straight from every
+response body.
+
+Measured on an RTX 4070 Laptop GPU, TinyLlama-1.1B, 16 new tokens, after warmup: a single
+request's shared forward pass takes ~500ms; six concurrent requests land in one batch and
+share a ~765ms forward pass — ~4x the throughput of running them one at a time. That's
+the whole point of batching, with real numbers instead of simulated ones.
 
 ## Project Structure
 
 ```
 flux/
 ├── src/flux/
-│   ├── api/
-│   │   └── main.py           # FastAPI app: /predict, /workers, /jobs (legacy), /metrics
-│   ├── batcher/
-│   │   └── batcher.py        # Dynamic batching logic
-│   ├── scheduler/
-│   │   ├── scheduler.py      # Main scheduler + inference dispatch
-│   │   ├── placement.py      # Model-aware routing (+ legacy bin-packing strategies)
-│   │   ├── registry.py       # Worker registry, heartbeats
-│   │   └── queue.py          # Priority queue w/ aging (legacy job path)
-│   ├── worker/
-│   │   ├── executor.py       # ONNX Runtime executor (mock-mode fallback)
-│   │   └── main.py           # Worker service
-│   └── models/
-│       ├── request.py        # PredictRequest/Response, InferenceBatch
-│       ├── worker.py         # Worker with GPU/model info
-│       ├── job.py            # Job (legacy)
-│       └── resources.py      # CPU/memory/GPU resource math
-├── models/                   # ONNX model files (empty — mock mode used until populated)
+│   ├── schemas.py     # GenerateRequest/GenerateResponse - the wire format
+│   ├── queue.py        # RequestQueue: async pool, each request carries a Future
+│   ├── scheduler.py    # select_batch(): FIFO / PRIORITY / EDF, swappable
+│   ├── engine.py        # Loads TinyLlama, owns the batch loop, times queue vs compute
+│   └── server.py        # FastAPI app: POST /generate, GET /health, GET /stats
+├── scripts/
+│   └── benchmark.py     # Policy x concurrency sweep -> CSV
 ├── tests/
-├── docker/
+│   ├── test_queue.py
+│   └── test_scheduler.py
 └── pyproject.toml
 ```
 
 ## Known Limitations
 
-Found while cleaning this up — real gaps, not yet fixed, worth knowing before scaling:
+Real gaps in the current design, worth knowing before quoting a number or planning the
+next piece of work:
 
-- **No connection pooling on dispatch.** `Scheduler.dispatch_batch` opens a new
-  `httpx.AsyncClient()` per batch dispatch instead of reusing a pooled client. Measurable
-  overhead per request; first thing to fix before any real throughput benchmark.
-- **Heartbeats carry no payload.** `WorkerHeartbeat` (GPU memory used, loaded models,
-  available resources) is defined but never sent or read — `POST /workers/{id}/heartbeat`
-  only refreshes the timestamp. `gpu_memory_used_mb`/`gpu_memory_total_mb` are therefore
-  fixed at whatever was passed at registration (0 unless set explicitly), so the
-  cold-start "most free GPU memory" tie-break has no real signal in practice.
-- **Worker-failure recovery doesn't cover in-flight inference batches.** Heartbeat-based
-  failure detection and rescheduling (`_handle_worker_failure`) only re-queues legacy
-  `Job`s via `current_jobs`; an inference batch in flight to a worker that dies just
-  errors out to the waiting client (no reroute/retry).
-- **No retry on `/predict`.** A failed batch propagates the exception to every request in
-  it. Retry logic exists only in the legacy job scheduler.
-- **Scheduler has no HA.** Single in-memory process; see the architecture note above.
-- **`flux_cluster_utilization` is dead weight for inference-only workers.** It's computed
-  from `Worker.available` vs. `Worker.capacity`, but `dispatch_batch` (the inference
-  path) never calls `worker.allocate()`/`.release()` — only the legacy job-dispatch path
-  does. A worker serving only inference traffic always reports whatever utilization it
-  had at registration (static, usually 0), regardless of real load.
+- **Request-level batching, not continuous batching.** A batch runs to completion (every
+  sequence finishes its `generate()` call) before the engine can form the next one — a
+  request that arrives mid-batch waits for the whole batch to finish, even if its own
+  generation would be short. Real systems (vLLM, TensorRT-LLM) let new requests join and
+  finished ones leave every decode step. That's the natural next target once KV cache
+  management is in place.
+- **Shared `max_new_tokens` per batch.** One `generate()` call uses the largest
+  `max_new_tokens` asked for in the batch; a request asking for fewer tokens still waits
+  for the longest one in its batch, then gets truncated down to what it asked for.
+- **No KV cache reuse across requests or batches.** Each `generate()` call manages its
+  own ephemeral KV cache internally; there's no prefix sharing, paging, or cache-aware
+  scheduling yet. That's the KV-cache half of this project's learning goal, still ahead.
+- **Single GPU, single model, single process — by design.** This is deliberately not a
+  platform. Docker/Prometheus/Grafana were cut from the core path; they can come back as
+  optional extras once the runtime itself has real numbers to show.
 
 ## Roadmap
 
-### Phase 1: Core MVP (COMPLETE)
-- [x] Request/Response models
-- [x] Worker registry
-- [x] Dynamic batcher (32 req or 10ms timeout)
-- [x] Model-aware placement (prefer warm workers)
-- [x] ONNX executor (with mock mode for dev)
-- [x] `/predict` endpoint (sync response)
-- [x] `/infer` worker endpoint
-- [x] Backpressure handling (503 when overloaded)
-- [x] Request timeout handling (`timeout_ms` → 504)
-- [x] Heartbeat-based worker health detection
-- [x] Prometheus metrics
-- [x] Legacy job scheduler: priority queue + aging, preemption, best-fit bin-packing
+The two end artifacts this project is building toward:
 
-Phase 1 proves the plumbing — queueing, routing, failure detection — on a toy
-static-batching model server. It does not demonstrate what inference-infra roles
-actually hire for in 2026: continuous batching, token-level scheduling, and
-KV-cache-aware routing for LLMs. Phases 2-4 below replace the old "more Grafana,
-autoscaling, TensorRT-as-a-checkbox" plan with that instead. Each phase is gated on the
-previous one actually working — this is a sequence, not a parallel checklist.
+1. An LLM inference runtime benchmarked honestly under concurrent load (the sweep above,
+   with real percentiles and a real queue/compute split - not simulated numbers).
+2. One custom profiled CUDA kernel with before-and-after numbers and a roofline
+   explanation for *why* it helped.
 
-### Phase 2: Real LLM Serving (continuous batching)
-- [ ] Swap the primary path to a small LLM (Qwen2.5-1.5B or Llama-3.2-1B); keep the
-      current ONNX/mock path as a secondary demo, not the headline
-- [ ] Replace fixed-window dynamic batching (32 req / 10ms) with continuous batching —
-      new requests join every decode iteration, finished ones leave mid-batch
-- [ ] Batch by token budget (e.g. 2048 tokens/step), not request count; track per-request
-      KV cache memory — this is the real GPU bin-packing problem, not "worker has model
-      loaded"
-- [ ] Streaming responses + token-level metrics: TTFT, TPOT/inter-token latency, tok/s —
-      replace end-to-end `latency_ms` as the headline metric
-- [ ] Stand up vLLM as a separate comparison baseline (benchmark against it — don't wrap
-      it and call the wrapper Flux)
+Roughly in order from here:
 
-### Phase 3: Scheduling That Actually Matters
-- [ ] Two traffic classes (interactive vs. batch); prove priority/EDF admission protects
-      interactive p99 TPOT when batch traffic floods the queue (this is the EDF design
-      from the old Phase 2, re-applied to real token-level load instead of toy requests)
-- [ ] Prefix/KV-cache-aware routing — route to the worker already holding the matching
-      prefix's KV cache, not just "has the model loaded"
-- [ ] Open-loop load generator (fixed QPS / Poisson arrivals) — the current
-      `scripts/benchmark.py` is closed-loop/uniform-traffic and cannot produce or
-      differentiate this
-- [ ] Report **goodput** (throughput that still meets an SLO, e.g. TPOT < 50ms) as the
-      headline number, as a latency/throughput-vs-SLO graph — not a benchmark table
+- **Continuous batching** - let requests join/leave a forming batch every decode step,
+  not just between whole-batch `generate()` calls.
+- **KV-cache-aware scheduling** - track per-request KV cache memory as the real
+  batching constraint (token budget, not request count), and route/prioritize
+  accordingly.
+- **Token-level metrics** - TTFT (time to first token), TPOT (time per output token),
+  tok/s, and goodput-vs-SLO as the headline numbers instead of end-to-end latency alone.
+- **Kernel-level optimization** - profile one decode step with `torch.profiler` /
+  Nsight Systems (needs WSL2 - Triton's compiler is Linux-first), find what's actually
+  memory-bound, write one Triton kernel (fused RMSNorm+RoPE is a reasonable first
+  target), and report before/after TPOT with a roofline explanation.
 
-### Phase 4: Kernel-Level Optimization
-- [ ] Requires WSL2 (Ubuntu) — Triton's compiler and Nsight Systems CLI profiling are
-      Linux-first; don't fight MSVC/native-Windows CUDA tooling instead of learning this
-- [ ] Profile one decode step with Nsight Systems / `torch.profiler` before writing
-      anything — find out whether attention/norms are actually memory-bound
-- [ ] Write one Triton kernel (fused RMSNorm+RoPE first, fused softmax second) and plug
-      it into the decode loop
-- [ ] Report before/after TPOT with a roofline explanation for *why* it helped
-
-### Deprioritized — don't move the needle on the above
-Auto-retry (actively bad for LLM serving — doubles compute on a timeout that was just
-queueing, not failed), autoscaling, additional Prometheus metrics, warm pools, scheduler
-HA. Real production concerns, just not what gets this project from L2 to L3.
-
-### v2 Finish Line
-Flux serves an LLM with continuous batching, beats naive HF `generate()`, lands within a
-clearly-stated % of vLLM on goodput, and one custom kernel measurably drops TPOT with an
-explanation of why — not "Phase 5 done."
-
-## Benchmarking
-
-`scripts/benchmark.py` drives `/predict` at a configurable concurrency and batch size and
-reports p50/p95/p99 latency + throughput; `--save`/`--compare` let you diff a baseline
-against a change. No results are checked into this repo yet — run it yourself and record
-real numbers before quoting any latency/throughput figure for this project. This harness
-is closed-loop and request-level — fine for Phase 1, not sufficient for Phase 3's
-open-loop/goodput work (new harness needed there; see Roadmap).
-
-```bash
-python -m flux.api.main &
-python -m flux.worker.main &
-python scripts/benchmark.py --requests 1000 --concurrency 10 --save baseline.json
-```
-
-## Tech Stack
-
-**Phase 1 (current):**
-- **API**: FastAPI + Uvicorn
-- **Batching**: asyncio Queue + Futures, fixed window (32 req / 10ms)
-- **Inference**: ONNX Runtime (CPU/CUDA providers), mock-mode fallback
-- **Metrics**: Prometheus + Grafana
-- **Container**: Docker Compose (scheduler, N workers, Prometheus, Grafana)
-
-**Phase 2+ (target):**
-- **Inference**: Qwen2.5-1.5B / Llama-3.2-1B via a hand-rolled continuous-batching decode
-  loop, benchmarked against vLLM
-- **Kernels**: Triton (fused RMSNorm+RoPE, fused softmax), profiled with Nsight
-  Systems / `torch.profiler` — requires WSL2
-- **Metrics**: TTFT, TPOT, tok/s, goodput-vs-SLO
+Deprioritized on purpose: auto-retry, autoscaling, worker pools, scheduler HA - none of
+that teaches batching, scheduling, KV cache, or kernels, which is the actual point.
