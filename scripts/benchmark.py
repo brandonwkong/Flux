@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Benchmark script for TaskForge inference platform.
+Benchmark script for Flux inference platform.
 
 Run this BEFORE and AFTER optimizations to measure improvement.
 
@@ -277,7 +277,7 @@ async def check_server() -> bool:
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Benchmark TaskForge inference")
+    parser = argparse.ArgumentParser(description="Benchmark Flux inference")
     parser.add_argument("--url", default="http://localhost:8000/predict", help="API URL")
     parser.add_argument("--requests", "-n", type=int, default=1000, help="Number of requests")
     parser.add_argument("--concurrency", "-c", type=int, default=10, help="Concurrent requests")

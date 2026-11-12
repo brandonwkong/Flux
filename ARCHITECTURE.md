@@ -1,6 +1,8 @@
 # Flux Architecture
 
-> A distributed ML inference platform with dynamic batching, GPU-aware scheduling, and bin-packing placement.
+> An ML inference serving platform: dynamic batching, model-aware worker routing, and a
+> central scheduler orchestrating horizontally-scalable worker nodes over HTTP. See
+> [Known Limitations](#known-limitations) for what's not true yet.
 
 ---
 
@@ -14,6 +16,8 @@
 6. [API Reference](#api-reference)
 7. [Configuration](#configuration)
 8. [Metrics](#metrics)
+9. [Known Limitations](#known-limitations)
+10. [Benchmarking](#benchmarking)
 
 ---
 
@@ -26,7 +30,7 @@ Flux is an ML inference serving system that handles the complete lifecycle from 
                                     |
                                     v
     +------------------------------------------------------------------+
-    |                           FLUX                              |
+    |                               FLUX                               |
     |                                                                  |
     |   +----------+     +-----------+     +-------------+             |
     |   |   API    |---->|  Batcher  |---->|  Scheduler  |             |
@@ -399,7 +403,7 @@ flux/
 │   ├── scheduler/                # Scheduling & placement
 │   │   ├── __init__.py
 │   │   ├── scheduler.py          # Main scheduler, dispatch logic
-│   │   ├── placement.py          # Bin-packing algorithms
+│   │   ├── placement.py          # Model-aware routing (inference) + bin-packing (legacy jobs)
 │   │   ├── registry.py           # Worker registry, heartbeats
 │   │   └── queue.py              # Priority queue (legacy jobs)
 │   │
@@ -539,24 +543,32 @@ BATCH_TIMEOUT_MS=10
 
 ### Prometheus Metrics
 
+Inference path (`/predict`):
+
 | Metric | Type | Description |
 |--------|------|-------------|
 | `flux_request_latency_seconds` | Histogram | End-to-end latency |
 | `flux_requests_total` | Counter | Total requests by model/status |
 | `flux_batch_size` | Histogram | Batch size distribution |
 | `flux_batch_wait_ms` | Histogram | Time requests wait for batching |
-| `flux_queue_depth` | Gauge | Pending requests |
-| `flux_cluster_utilization` | Gauge | Cluster resource utilization |
+| `flux_batcher_queue_depth` | Gauge | Pending requests per model, in the batcher |
 | `flux_worker_inference_latency_seconds` | Histogram | Worker inference time |
+| `flux_worker_model_load_seconds` | Histogram | Model load time on worker |
 
-### Key SLOs
+Legacy job scheduler (not touched by `/predict`):
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `flux_queue_depth` | Gauge | Pending legacy jobs |
+| `flux_cluster_utilization` | Gauge | Declared resource utilization (allocated ÷ capacity) across workers — not live GPU telemetry; see Known Limitations |
+
+### Key SLOs (targets — not yet measured; see Benchmarking)
 
 | Metric | Target |
 |--------|--------|
 | p50 latency | < 15ms |
 | p99 latency | < 50ms |
 | Throughput | > 1000 req/sec |
-| GPU utilization | > 80% |
 | Error rate | < 0.1% |
 
 ---
@@ -594,13 +606,48 @@ docker-compose up --build
 
 ---
 
-## Resume Bullet
+## Known Limitations
 
-> Built a distributed ML inference platform with dynamic batching, GPU-aware scheduling, and bin-packing placement - achieving 10K req/sec at <20ms p99 latency with full Prometheus/Grafana observability
+Real, verified gaps — not fixed here, worth knowing before scaling further:
 
-**Covers:**
-- Distributed systems
-- ML infrastructure
-- Scheduling algorithms
-- Performance optimization
-- Observability
+- **No connection pooling on dispatch.** `Scheduler.dispatch_batch` opens a new
+  `httpx.AsyncClient()` per batch dispatch rather than reusing a pooled client. First
+  thing to fix before trusting any throughput benchmark.
+- **Heartbeats carry no payload.** `WorkerHeartbeat` (GPU memory, loaded models,
+  available resources) is defined in `models/worker.py` but never sent by the worker or
+  read by the scheduler — `POST /workers/{id}/heartbeat` only refreshes the timestamp.
+  `gpu_memory_used_mb`/`gpu_memory_total_mb` stay fixed at whatever was passed at
+  registration (0 by default), so the cold-start "most free GPU memory" tie-break in
+  `_model_aware_placement` has no real signal in a live deployment.
+- **`flux_cluster_utilization` is dead weight for inference-only workers.** It's derived
+  from `Worker.available` vs. `Worker.capacity`, but the inference dispatch path
+  (`dispatch_batch`) never calls `worker.allocate()`/`.release()` — only the legacy
+  job-dispatch path does. An inference-only worker reports whatever utilization it had
+  at registration, forever.
+- **Worker-failure recovery doesn't cover in-flight inference batches.**
+  `_handle_worker_failure` re-queues legacy `Job`s via `worker.current_jobs`; an
+  inference batch dispatched to a worker that dies mid-flight just errors out to the
+  waiting client — no reroute, no retry.
+- **No retry on `/predict`.** A failed batch propagates the exception to every request
+  in it. Retry (`can_retry`/`retry_count`) exists only in the legacy job scheduler.
+- **Scheduler has no HA.** Single in-memory process, no replication, no leader election.
+  This is a centralized-coordinator architecture, not a decentralized one — see the note
+  at the top of this document.
+
+## Benchmarking
+
+`scripts/benchmark.py` drives `/predict` and reports p50/p95/p99 + throughput, with
+`--save`/`--compare` for diffing runs. No results are checked into this repo — the SLO
+targets above are targets, not measurements. Run it yourself before quoting a number:
+
+```bash
+python -m flux.api.main &
+python -m flux.worker.main &
+python scripts/benchmark.py --requests 1000 --concurrency 10 --save baseline.json
+```
+
+Note the closed-loop caveat: `benchmark.py` bounds concurrency with a semaphore rather
+than firing at a fixed arrival rate, and sends uniform traffic (no priority/deadline
+mix) — fine for a smoke test, not sufficient to make a "sustained N req/s" claim or to
+differentiate scheduling policies once those exist (see README.md's Roadmap, Phase 3 —
+"Scheduling That Actually Matters").

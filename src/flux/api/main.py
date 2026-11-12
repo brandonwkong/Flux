@@ -1,15 +1,16 @@
-"""FastAPI application for TaskForge ML inference platform."""
+"""FastAPI application for Flux ML inference platform."""
 
+import asyncio
+import os
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Optional
-import time
-import os
 
 import structlog
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest, Counter, Histogram, Gauge
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest, Counter, Histogram
 
 from flux.models.job import Job, JobStatus, JobSubmission
 from flux.models.request import (
@@ -37,10 +38,6 @@ REQUESTS_TOTAL = Counter(
     "Total requests",
     ["model", "status"],
 )
-QUEUE_DEPTH = Gauge(
-    "flux_queue_depth",
-    "Pending requests in queue",
-)
 
 # Global instances
 scheduler: Optional[Scheduler] = None
@@ -50,6 +47,7 @@ batcher: Optional[Batcher] = None
 MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "32"))
 BATCH_TIMEOUT_MS = float(os.environ.get("BATCH_TIMEOUT_MS", "10"))
 MAX_QUEUE_DEPTH = int(os.environ.get("MAX_QUEUE_DEPTH", "1000"))
+WORKER_TIMEOUT_S = float(os.environ.get("WORKER_TIMEOUT_S", "30"))
 
 
 async def process_batch(batch: InferenceBatch) -> list[Any]:
@@ -79,7 +77,7 @@ async def lifespan(app: FastAPI):
     global scheduler, batcher
 
     # Startup
-    scheduler = Scheduler()
+    scheduler = Scheduler(heartbeat_timeout=WORKER_TIMEOUT_S)
     await scheduler.start()
 
     batcher_config = BatcherConfig(
@@ -107,7 +105,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="TaskForge",
+    title="Flux",
     description="Distributed ML Inference Platform",
     version="0.1.0",
     lifespan=lifespan,
@@ -407,10 +405,6 @@ async def job_failed_callback(job_id: str, error: str) -> dict:
 
     await scheduler.job_failed(job_id, error)
     return {"status": "ok"}
-
-
-# Need asyncio for TimeoutError
-import asyncio
 
 
 def run() -> None:

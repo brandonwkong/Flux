@@ -68,7 +68,7 @@ class Scheduler:
 
     def __init__(
         self,
-        placement_strategy: PlacementStrategy = PlacementStrategy.BEST_FIT,
+        placement_strategy: PlacementStrategy = PlacementStrategy.MODEL_AWARE,
         heartbeat_timeout: float = 30.0,
         scheduling_interval: float = 0.1,
         enable_preemption: bool = True,
@@ -316,7 +316,6 @@ class Scheduler:
         Returns:
             List of predictions from the worker
         """
-        import time
         start = time.perf_counter()
 
         worker.pending_batches += 1

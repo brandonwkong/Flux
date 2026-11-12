@@ -208,7 +208,7 @@ def print_comparison(results: list[dict]) -> None:
 
 async def main():
     print("=" * 80)
-    print("  TASKFORGE BENCHMARK SIMULATION")
+    print("  FLUX BENCHMARK SIMULATION")
     print("  (Simulated numbers - run against real server for actual results)")
     print("=" * 80)
 

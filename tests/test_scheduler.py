@@ -3,9 +3,11 @@
 import pytest
 from flux.models.resources import Resources
 from flux.models.job import Job, JobStatus, JobPriority
+from flux.models.request import InferenceBatch
 from flux.models.worker import Worker
 from flux.scheduler.queue import JobQueue
 from flux.scheduler.placement import PlacementEngine, PlacementStrategy
+from flux.scheduler.scheduler import Scheduler
 
 
 class TestJobQueue:
@@ -146,3 +148,72 @@ class TestPlacementEngine:
         worker = engine.find_worker(job, workers)
         assert worker is not None
         assert worker.name == "medium"  # Smallest with GPU
+
+
+class TestInferencePlacement:
+    """Covers find_worker_for_batch, the placement path actually used by /predict."""
+
+    def test_prefers_warm_worker_over_lower_pending_cold_worker(self):
+        """A warm worker must win even if a cold worker has a lower queue depth.
+
+        This is the whole point of model-aware routing: skipping the model-load
+        cold-start cost outweighs a marginally busier warm worker. Regression
+        guard for the bug where BEST_FIT (lowest pending_batches, model-blind)
+        was silently the default and always picked the cold worker here.
+        """
+        engine = PlacementEngine(strategy=PlacementStrategy.MODEL_AWARE)
+
+        cold_idle = Worker(
+            name="cold-idle",
+            host="localhost",
+            capacity=Resources(cpu=4, memory=4096, gpu=1),
+            available=Resources(cpu=4, memory=4096, gpu=1),
+            pending_batches=0,
+        )
+        warm_busy = Worker(
+            name="warm-busy",
+            host="localhost",
+            capacity=Resources(cpu=4, memory=4096, gpu=1),
+            available=Resources(cpu=4, memory=4096, gpu=1),
+            pending_batches=1,
+            loaded_models=["resnet50"],
+        )
+
+        batch = InferenceBatch(model="resnet50")
+        worker = engine.find_worker_for_batch(batch, [cold_idle, warm_busy])
+
+        assert worker is not None
+        assert worker.name == "warm-busy"
+
+    def test_falls_back_to_most_free_gpu_memory_when_no_worker_is_warm(self):
+        engine = PlacementEngine(strategy=PlacementStrategy.MODEL_AWARE)
+
+        low_mem = Worker(
+            name="low-mem",
+            host="localhost",
+            capacity=Resources(cpu=4, memory=4096, gpu=1),
+            available=Resources(cpu=4, memory=4096, gpu=1),
+            gpu_memory_total_mb=8000,
+            gpu_memory_used_mb=7000,
+        )
+        high_mem = Worker(
+            name="high-mem",
+            host="localhost",
+            capacity=Resources(cpu=4, memory=4096, gpu=1),
+            available=Resources(cpu=4, memory=4096, gpu=1),
+            gpu_memory_total_mb=8000,
+            gpu_memory_used_mb=1000,
+        )
+
+        batch = InferenceBatch(model="resnet50")
+        worker = engine.find_worker_for_batch(batch, [low_mem, high_mem])
+
+        assert worker is not None
+        assert worker.name == "high-mem"
+
+
+class TestSchedulerDefaults:
+    def test_default_placement_strategy_is_model_aware(self):
+        """The /predict path relies on this default; api/main.py never overrides it."""
+        scheduler = Scheduler()
+        assert scheduler.placement.strategy == PlacementStrategy.MODEL_AWARE

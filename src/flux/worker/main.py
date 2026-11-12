@@ -177,7 +177,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="TaskForge Worker",
+    title="Flux Worker",
     version="0.1.0",
     lifespan=lifespan,
 )

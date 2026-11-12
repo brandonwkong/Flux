@@ -1,1 +1,1 @@
-"""TaskForge Scheduler."""
+"""Flux Scheduler."""

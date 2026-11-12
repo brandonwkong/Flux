@@ -1,7 +1,7 @@
 [project]
 name = "flux"
 version = "0.1.0"
-description = "Distributed ML inference platform with dynamic batching, GPU-aware scheduling, and bin-packing placement"
+description = "ML inference serving platform with dynamic batching, model-aware routing, and a scheduler/worker-pool architecture for horizontally-scalable inference"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

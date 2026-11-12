@@ -1,4 +1,4 @@
-"""Core data models for TaskForge."""
+"""Core data models for Flux."""
 
 from flux.models.resources import Resources
 from flux.models.job import Job, JobStatus, JobPriority
