@@ -1,353 +1,248 @@
 #!/usr/bin/env python
-"""
-Benchmark script for Flux inference platform.
+"""Benchmark harness: real concurrent load against a running Flux server.
 
-Run this BEFORE and AFTER optimizations to measure improvement.
+This is a first-class part of the project, not an afterthought - its job
+is to answer "how does each scheduling policy actually behave under
+concurrent load" honestly, with real HTTP requests hitting a real model.
+
+Because SCHEDULING_POLICY is fixed when the server process starts (see
+server.py), sweeping policies means restarting the server - this script
+does that itself, once per policy, and reuses that one running server
+across all of that policy's concurrency levels. One command runs the
+whole sweep and writes one row per (policy, concurrency) combination
+to CSV: latency percentiles, throughput, and the queue-time vs
+compute-time split the server reports for every request.
 
 Usage:
-    # Start server first
-    python -m flux.api.main
+    # Default sweep: 3 policies x 5 concurrency levels, one command.
+    python scripts/benchmark.py --output results.csv
 
-    # Run benchmark
-    python scripts/benchmark.py
-
-    # Save results
-    python scripts/benchmark.py --save baseline.json
-    python scripts/benchmark.py --save optimized.json
-
-    # Compare
-    python scripts/benchmark.py --compare baseline.json optimized.json
+    # Customize:
+    python scripts/benchmark.py \
+        --policies fifo,priority,edf \
+        --concurrencies 1,2,4,8,16 \
+        --requests 200 \
+        --output results.csv
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio
-import json
+import csv
+import os
 import statistics
+import subprocess
+import sys
 import time
-from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 import httpx
 
+SERVER_URL = "http://localhost:8000"
+STARTUP_TIMEOUT_S = 180.0  # TinyLlama load + first-run HF download can take a while
+
 
 @dataclass
-class BenchmarkResult:
-    """Results from a benchmark run."""
+class RunResult:
+    """Everything measured for one (policy, concurrency) combination."""
 
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
-    name: str = "benchmark"
-
-    # Config
-    num_requests: int = 0
-    concurrency: int = 0
-    batch_size: int = 0
-
-    # Latency (milliseconds)
-    latency_p50: float = 0.0
-    latency_p95: float = 0.0
-    latency_p99: float = 0.0
-    latency_avg: float = 0.0
-    latency_min: float = 0.0
-    latency_max: float = 0.0
-
-    # Throughput
-    total_time_s: float = 0.0
-    requests_per_sec: float = 0.0
-
-    # Errors
+    policy: str
+    concurrency: int
+    num_requests: int
     success_count: int = 0
     error_count: int = 0
-    timeout_count: int = 0
+    total_time_s: float = 0.0
+    latencies_ms: list[float] = field(default_factory=list)
+    queue_times_ms: list[float] = field(default_factory=list)
+    compute_times_ms: list[float] = field(default_factory=list)
+    batch_sizes: list[int] = field(default_factory=list)
 
-    def print_summary(self) -> None:
-        """Print human-readable summary."""
-        print("\n" + "=" * 60)
-        print(f"  BENCHMARK RESULTS: {self.name}")
-        print("=" * 60)
-        print(f"\n  Configuration:")
-        print(f"    Requests:    {self.num_requests}")
-        print(f"    Concurrency: {self.concurrency}")
-        print(f"    Batch size:  {self.batch_size}")
+    @staticmethod
+    def _percentile(data: list[float], p: float) -> float:
+        if not data:
+            return 0.0
+        ordered = sorted(data)
+        idx = int(len(ordered) * p / 100)
+        return ordered[min(idx, len(ordered) - 1)]
 
-        print(f"\n  Latency (ms):")
-        print(f"    p50:  {self.latency_p50:>8.2f} ms")
-        print(f"    p95:  {self.latency_p95:>8.2f} ms")
-        print(f"    p99:  {self.latency_p99:>8.2f} ms")
-        print(f"    avg:  {self.latency_avg:>8.2f} ms")
-        print(f"    min:  {self.latency_min:>8.2f} ms")
-        print(f"    max:  {self.latency_max:>8.2f} ms")
-
-        print(f"\n  Throughput:")
-        print(f"    Total time:  {self.total_time_s:.2f} s")
-        print(f"    Requests/s:  {self.requests_per_sec:.1f}")
-
-        print(f"\n  Results:")
-        print(f"    Success: {self.success_count}")
-        print(f"    Errors:  {self.error_count}")
-        print(f"    Timeout: {self.timeout_count}")
-
-        success_rate = (self.success_count / self.num_requests * 100) if self.num_requests > 0 else 0
-        print(f"    Rate:    {success_rate:.1f}%")
-        print("=" * 60)
+    def to_row(self) -> dict:
+        return {
+            "policy": self.policy,
+            "concurrency": self.concurrency,
+            "num_requests": self.num_requests,
+            "success_count": self.success_count,
+            "error_count": self.error_count,
+            "requests_per_sec": (
+                self.success_count / self.total_time_s if self.total_time_s > 0 else 0.0
+            ),
+            "latency_p50_ms": self._percentile(self.latencies_ms, 50),
+            "latency_p95_ms": self._percentile(self.latencies_ms, 95),
+            "latency_p99_ms": self._percentile(self.latencies_ms, 99),
+            "latency_avg_ms": statistics.mean(self.latencies_ms) if self.latencies_ms else 0.0,
+            "queue_time_avg_ms": statistics.mean(self.queue_times_ms) if self.queue_times_ms else 0.0,
+            "compute_time_avg_ms": statistics.mean(self.compute_times_ms) if self.compute_times_ms else 0.0,
+            "avg_batch_size": statistics.mean(self.batch_sizes) if self.batch_sizes else 0.0,
+        }
 
 
-async def make_request(
+async def _one_request(
     client: httpx.AsyncClient,
-    url: str,
-    payload: dict,
-    timeout: float = 30.0,
-) -> tuple[float, bool, Optional[str]]:
-    """Make a single request and return (latency_ms, success, error)."""
+    prompt: str,
+    max_new_tokens: int,
+) -> tuple[float, Optional[dict]]:
+    """Fire one request, return (client-measured latency_ms, response JSON or None on failure)."""
     start = time.perf_counter()
     try:
-        response = await client.post(url, json=payload, timeout=timeout)
+        response = await client.post(
+            f"{SERVER_URL}/generate",
+            json={"prompt": prompt, "max_new_tokens": max_new_tokens},
+            timeout=60.0,
+        )
         elapsed_ms = (time.perf_counter() - start) * 1000
-
         if response.status_code == 200:
-            return elapsed_ms, True, None
-        else:
-            return elapsed_ms, False, f"HTTP {response.status_code}"
-
-    except httpx.TimeoutException:
+            return elapsed_ms, response.json()
+        return elapsed_ms, None
+    except Exception:
         elapsed_ms = (time.perf_counter() - start) * 1000
-        return elapsed_ms, False, "timeout"
-    except Exception as e:
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        return elapsed_ms, False, str(e)
+        return elapsed_ms, None
 
 
-async def run_benchmark(
-    url: str = "http://localhost:8000/predict",
-    num_requests: int = 1000,
-    concurrency: int = 10,
-    batch_size: int = 1,
-    model: str = "resnet50",
-    name: str = "benchmark",
-) -> BenchmarkResult:
-    """Run the benchmark."""
-
-    print(f"\nRunning benchmark: {name}")
-    print(f"  URL: {url}")
-    print(f"  Requests: {num_requests}")
-    print(f"  Concurrency: {concurrency}")
-    print(f"  Batch size: {batch_size}")
-    print(f"  Model: {model}")
-
-    # Create payload
-    # Simulate image input (224x224x3 = 150528 floats, but we'll use smaller for testing)
-    input_data = [[0.5] * 100 for _ in range(batch_size)]
-    payload = {
-        "model": model,
-        "inputs": input_data,
-    }
-
-    latencies: list[float] = []
-    success_count = 0
-    error_count = 0
-    timeout_count = 0
-
+async def run_one(
+    policy: str,
+    concurrency: int,
+    num_requests: int,
+    max_new_tokens: int,
+) -> RunResult:
+    """Fire num_requests requests at the (already running) server, bounded by a semaphore."""
+    result = RunResult(policy=policy, concurrency=concurrency, num_requests=num_requests)
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def bounded_request(client: httpx.AsyncClient) -> tuple[float, bool, Optional[str]]:
+    async def bounded(client: httpx.AsyncClient, i: int) -> tuple[float, Optional[dict]]:
         async with semaphore:
-            return await make_request(client, url, payload)
+            return await _one_request(
+                client, f"Request {i}: tell me something interesting about space.", max_new_tokens
+            )
 
-    print("\n  Running...")
-    start_time = time.perf_counter()
-
+    start = time.perf_counter()
     async with httpx.AsyncClient() as client:
-        # Create all tasks
-        tasks = [bounded_request(client) for _ in range(num_requests)]
-
-        # Run with progress
-        completed = 0
+        tasks = [bounded(client, i) for i in range(num_requests)]
         for coro in asyncio.as_completed(tasks):
-            latency_ms, success, error = await coro
-            latencies.append(latency_ms)
-
-            if success:
-                success_count += 1
-            elif error == "timeout":
-                timeout_count += 1
+            elapsed_ms, payload = await coro
+            if payload is not None:
+                result.success_count += 1
+                result.latencies_ms.append(elapsed_ms)
+                result.queue_times_ms.append(payload["queue_time_ms"])
+                result.compute_times_ms.append(payload["compute_time_ms"])
+                result.batch_sizes.append(payload["batch_size"])
             else:
-                error_count += 1
+                result.error_count += 1
 
-            completed += 1
-            if completed % 100 == 0:
-                print(f"    Progress: {completed}/{num_requests}")
-
-    total_time = time.perf_counter() - start_time
-
-    # Calculate statistics
-    latencies.sort()
-
-    def percentile(data: list[float], p: float) -> float:
-        idx = int(len(data) * p / 100)
-        return data[min(idx, len(data) - 1)]
-
-    result = BenchmarkResult(
-        name=name,
-        num_requests=num_requests,
-        concurrency=concurrency,
-        batch_size=batch_size,
-        latency_p50=percentile(latencies, 50),
-        latency_p95=percentile(latencies, 95),
-        latency_p99=percentile(latencies, 99),
-        latency_avg=statistics.mean(latencies),
-        latency_min=min(latencies),
-        latency_max=max(latencies),
-        total_time_s=total_time,
-        requests_per_sec=num_requests / total_time,
-        success_count=success_count,
-        error_count=error_count,
-        timeout_count=timeout_count,
-    )
-
+    result.total_time_s = time.perf_counter() - start
     return result
 
 
-def compare_results(baseline_path: str, optimized_path: str) -> None:
-    """Compare two benchmark results."""
-
-    with open(baseline_path) as f:
-        baseline = json.load(f)
-    with open(optimized_path) as f:
-        optimized = json.load(f)
-
-    print("\n" + "=" * 70)
-    print("  BENCHMARK COMPARISON")
-    print("=" * 70)
-
-    print(f"\n  {'Metric':<25} {'Baseline':>15} {'Optimized':>15} {'Change':>12}")
-    print("  " + "-" * 67)
-
-    metrics = [
-        ("Latency p50 (ms)", "latency_p50", True),
-        ("Latency p95 (ms)", "latency_p95", True),
-        ("Latency p99 (ms)", "latency_p99", True),
-        ("Latency avg (ms)", "latency_avg", True),
-        ("Throughput (req/s)", "requests_per_sec", False),
-    ]
-
-    for label, key, lower_is_better in metrics:
-        base_val = baseline[key]
-        opt_val = optimized[key]
-
-        if base_val > 0:
-            if lower_is_better:
-                change_pct = (base_val - opt_val) / base_val * 100
-                change_str = f"{change_pct:+.1f}%"
-                if change_pct > 0:
-                    change_str += " better"
-            else:
-                change_pct = (opt_val - base_val) / base_val * 100
-                change_str = f"{change_pct:+.1f}%"
-                if change_pct > 0:
-                    change_str += " better"
-        else:
-            change_str = "N/A"
-
-        print(f"  {label:<25} {base_val:>15.2f} {opt_val:>15.2f} {change_str:>12}")
-
-    print("=" * 70)
-
-    # Resume bullet suggestion
-    throughput_improvement = optimized["requests_per_sec"] / baseline["requests_per_sec"]
-    latency_improvement = baseline["latency_p99"] / optimized["latency_p99"]
-
-    print("\n  SUGGESTED RESUME BULLET:")
-    print("  " + "-" * 50)
-    print(f"  Improved inference throughput {throughput_improvement:.1f}x")
-    print(f"  ({baseline['requests_per_sec']:.0f} -> {optimized['requests_per_sec']:.0f} req/s)")
-    print(f"  and reduced p99 latency {latency_improvement:.1f}x")
-    print(f"  ({baseline['latency_p99']:.0f}ms -> {optimized['latency_p99']:.0f}ms)")
-    print("=" * 70)
+def start_server(policy: str) -> subprocess.Popen:
+    """Launch the server as a subprocess with SCHEDULING_POLICY set for this run."""
+    env = os.environ.copy()
+    env["SCHEDULING_POLICY"] = policy
+    return subprocess.Popen([sys.executable, "-m", "flux.server"], env=env)
 
 
-async def check_server() -> bool:
-    """Check if the server is running."""
+def wait_for_server(timeout: float = STARTUP_TIMEOUT_S) -> None:
+    """Poll /health until the server (and its model) is ready, or raise on timeout."""
+    deadline = time.perf_counter() + timeout
+    with httpx.Client() as client:
+        while time.perf_counter() < deadline:
+            try:
+                response = client.get(f"{SERVER_URL}/health", timeout=2.0)
+                if response.status_code == 200:
+                    return
+            except Exception:
+                pass
+            time.sleep(1.0)
+    raise RuntimeError(f"Server did not become healthy within {timeout}s")
+
+
+def stop_server(process: subprocess.Popen) -> None:
+    process.terminate()
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get("http://localhost:8000/health", timeout=5.0)
-            return response.status_code == 200
-    except:
-        return False
+        process.wait(timeout=15.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
-async def main():
-    parser = argparse.ArgumentParser(description="Benchmark Flux inference")
-    parser.add_argument("--url", default="http://localhost:8000/predict", help="API URL")
-    parser.add_argument("--requests", "-n", type=int, default=1000, help="Number of requests")
-    parser.add_argument("--concurrency", "-c", type=int, default=10, help="Concurrent requests")
-    parser.add_argument("--batch-size", "-b", type=int, default=1, help="Inputs per request")
-    parser.add_argument("--model", "-m", default="resnet50", help="Model name")
-    parser.add_argument("--name", default="benchmark", help="Benchmark name")
-    parser.add_argument("--save", type=str, help="Save results to JSON file")
-    parser.add_argument("--compare", nargs=2, metavar=("BASELINE", "OPTIMIZED"),
-                        help="Compare two result files")
+def write_csv(rows: list[dict], path: Path) -> None:
+    if not rows:
+        print("No results to write.")
+        return
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
 
+
+async def sweep(
+    policies: list[str],
+    concurrencies: list[int],
+    num_requests: int,
+    max_new_tokens: int,
+) -> list[dict]:
+    """Run every (policy, concurrency) combination, restarting the server once per policy."""
+    rows = []
+    for policy in policies:
+        print(f"\n=== Starting server with SCHEDULING_POLICY={policy} ===")
+        process = start_server(policy)
+        try:
+            wait_for_server()
+            print("Server ready.")
+
+            for concurrency in concurrencies:
+                print(f"  policy={policy} concurrency={concurrency} requests={num_requests}")
+                result = await run_one(policy, concurrency, num_requests, max_new_tokens)
+                row = result.to_row()
+                rows.append(row)
+                print(
+                    f"    p50={row['latency_p50_ms']:.1f}ms  p99={row['latency_p99_ms']:.1f}ms  "
+                    f"req/s={row['requests_per_sec']:.2f}  avg_batch={row['avg_batch_size']:.1f}  "
+                    f"errors={result.error_count}"
+                )
+        finally:
+            stop_server(process)
+
+    return rows
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Benchmark Flux under concurrent load, swept across scheduling policies"
+    )
+    parser.add_argument("--policies", default="fifo,priority,edf", help="Comma-separated policies")
+    parser.add_argument("--concurrencies", default="1,2,4,8,16", help="Comma-separated concurrency levels")
+    parser.add_argument(
+        "--requests", "-n", type=int, default=100, help="Requests per (policy, concurrency) combination"
+    )
+    parser.add_argument("--max-new-tokens", type=int, default=32, help="max_new_tokens per request")
+    parser.add_argument("--output", "-o", default="results.csv", help="CSV output path")
     args = parser.parse_args()
 
-    # Handle comparison mode
-    if args.compare:
-        compare_results(args.compare[0], args.compare[1])
-        return
+    policies = [p.strip() for p in args.policies.split(",")]
+    concurrencies = [int(c.strip()) for c in args.concurrencies.split(",")]
 
-    # Check server
-    print("Checking server...")
-    if not await check_server():
-        print("\nERROR: Server not running at http://localhost:8000")
-        print("Start it with: python -m flux.api.main")
-        return
-    print("Server is up!")
-
-    # Also register a mock worker if none exist
-    try:
-        async with httpx.AsyncClient() as client:
-            # Check workers
-            resp = await client.get("http://localhost:8000/workers")
-            workers = resp.json()
-
-            if len(workers) == 0:
-                print("No workers registered. Registering mock worker...")
-                await client.post(
-                    "http://localhost:8000/workers",
-                    json={
-                        "name": "benchmark-worker",
-                        "host": "localhost",
-                        "port": 8001,
-                        "capacity": {"cpu": 8, "memory": 16384, "gpu": 1},
-                        "gpu_memory_total_mb": 16000,
-                        "loaded_models": [args.model],
-                    }
-                )
-                print("Mock worker registered.")
-    except Exception as e:
-        print(f"Warning: Could not check/register workers: {e}")
-
-    # Run benchmark
-    result = await run_benchmark(
-        url=args.url,
-        num_requests=args.requests,
-        concurrency=args.concurrency,
-        batch_size=args.batch_size,
-        model=args.model,
-        name=args.name,
+    print(
+        f"Sweeping {len(policies)} policies x {len(concurrencies)} concurrency levels "
+        f"({len(policies) * len(concurrencies)} runs, {args.requests} requests each)"
     )
 
-    # Print results
-    result.print_summary()
+    rows = asyncio.run(sweep(policies, concurrencies, args.requests, args.max_new_tokens))
 
-    # Save if requested
-    if args.save:
-        path = Path(args.save)
-        with open(path, "w") as f:
-            json.dump(asdict(result), f, indent=2)
-        print(f"\nResults saved to: {path}")
-        print(f"Compare later with: python scripts/benchmark.py --compare {path} optimized.json")
+    output_path = Path(args.output)
+    write_csv(rows, output_path)
+    print(f"\nWrote {len(rows)} rows to {output_path}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
