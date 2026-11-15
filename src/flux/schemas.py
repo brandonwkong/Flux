@@ -21,3 +21,8 @@ class GenerateResponse(BaseModel):
     queue_time_ms: float = Field(description="Time spent waiting before the engine started this request")
     compute_time_ms: float = Field(description="Time spent in the model's forward pass(es) for this request")
     batch_size: int = Field(description="How many requests were batched together for this request's compute")
+    output_tokens: int = Field(
+        description="Tokens actually generated for this request, up to the first EOS "
+        "(not max_new_tokens - a batchmate finishing earlier gets padded, not truncated, "
+        "in the shared forward pass, so this is the real count, not the request)"
+    )

@@ -23,7 +23,9 @@ class TestRequestQueue:
         assert len(pending) == 1
 
         pending[0].future.set_result(
-            GenerateResponse(text="hello", queue_time_ms=1.0, compute_time_ms=2.0, batch_size=1)
+            GenerateResponse(
+                text="hello", queue_time_ms=1.0, compute_time_ms=2.0, batch_size=1, output_tokens=5
+            )
         )
         queue.remove(pending)
 

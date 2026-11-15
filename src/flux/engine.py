@@ -124,7 +124,7 @@ class Engine:
 
         loop = asyncio.get_event_loop()
         try:
-            texts = await loop.run_in_executor(None, self._generate, batch)
+            generations = await loop.run_in_executor(None, self._generate, batch)
         except Exception as e:
             logger.error("generate_error", error=str(e), batch_size=len(batch))
             for request in batch:
@@ -134,7 +134,7 @@ class Engine:
 
         compute_time_ms = (time.perf_counter() - compute_start) * 1000
 
-        for request, text, queue_time_ms in zip(batch, texts, queue_times_ms):
+        for request, (text, output_tokens), queue_time_ms in zip(batch, generations, queue_times_ms):
             if not request.future.done():
                 request.future.set_result(
                     GenerateResponse(
@@ -142,11 +142,19 @@ class Engine:
                         queue_time_ms=queue_time_ms,
                         compute_time_ms=compute_time_ms,
                         batch_size=len(batch),
+                        output_tokens=output_tokens,
                     )
                 )
 
-    def _generate(self, batch: list[QueuedRequest]) -> list[str]:
-        """Blocking: tokenize, pad, run one shared forward pass, decode each request's share."""
+    def _generate(self, batch: list[QueuedRequest]) -> list[tuple[str, int]]:
+        """Blocking: tokenize, pad, run one shared forward pass, decode each request's share.
+
+        Returns (text, output_tokens) per request. output_tokens counts real
+        generated tokens up to the first EOS, not max_new_tokens - a request
+        that finishes early still gets padded out to the batch's shared
+        max_new_tokens in the output tensor, so counting raw slice length
+        would overstate how much work this request actually caused.
+        """
         inputs = self._tokenizer(
             [r.prompt for r in batch],
             return_tensors="pt",
@@ -169,8 +177,12 @@ class Engine:
                 do_sample=False,
             )
 
-        texts = []
+        eos_id = self._tokenizer.eos_token_id
+        results = []
         for i, request in enumerate(batch):
             new_tokens = generated[i, input_len : input_len + request.max_new_tokens]
-            texts.append(self._tokenizer.decode(new_tokens, skip_special_tokens=True))
-        return texts
+            eos_positions = (new_tokens == eos_id).nonzero(as_tuple=True)[0]
+            output_tokens = eos_positions[0].item() if len(eos_positions) > 0 else len(new_tokens)
+            text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
+            results.append((text, output_tokens))
+        return results
