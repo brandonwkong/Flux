@@ -9,18 +9,32 @@ Because SCHEDULING_POLICY is fixed when the server process starts (see
 server.py), sweeping policies means restarting the server - this script
 does that itself, once per policy, and reuses that one running server
 across all of that policy's concurrency levels. One command runs the
-whole sweep and writes one row per (policy, concurrency) combination
-to CSV: latency percentiles, throughput, deadline-hit rate, and the
-queue-time vs compute-time split the server reports for every request.
+whole sweep and writes one row per (policy, concurrency) combination to
+CSV: latency percentiles, throughput, tokens/sec, deadline-hit rate
+(blended and per traffic class), goodput, and the queue-time vs
+compute-time split the server reports for every request.
 
 Every request is tagged as one of two synthetic traffic classes -
 "interactive" (high priority, tight deadline) or "batch" (low priority,
 relaxed deadline) - using a fixed random seed, so PRIORITY and EDF have
-something real to schedule on. Without this, every request would look
-identical and all three policies would just tie-break to arrival order
-(i.e. behave exactly like FIFO). The same seed means every (policy,
+something real to schedule on. The same seed means every (policy,
 concurrency) run sees the identical request stream, so differences in
 the results come from the policy, not from random variation in load.
+
+Load model (--load-model):
+    virtual (default) - `concurrency` virtual users, each looping
+        send -> await response -> send next, pulling the next request
+        off the same fixed-seed stream until num_requests total have
+        completed. Client latency is measured per request, send to
+        response, inside that loop - there is no artificial queue
+        beyond genuine concurrency.
+    burst - the old behavior: all num_requests created at once,
+        gated through a semaphore of size `concurrency`. At low
+        concurrency this means most requests sit in a long client-side
+        line before their turn even starts, which that line's wait
+        now counts as part of their latency (see git history - this
+        used to be silently excluded, which was its own bug). Kept
+        available for comparison, not the default.
 
 Usage:
     # Default sweep: 3 policies x 5 concurrency levels, one command.
@@ -30,7 +44,7 @@ Usage:
     python scripts/benchmark.py \
         --policies fifo,priority,edf \
         --concurrencies 1,2,4,8,16 \
-        --requests 200 \
+        --requests 200 --repeats 3 \
         --output results.csv
 """
 
@@ -54,10 +68,13 @@ import httpx
 SERVER_URL = "http://127.0.0.1:8000"  # not "localhost": Windows httpx tries ::1 first and stalls ~2s before IPv4 fallback
 STARTUP_TIMEOUT_S = 180.0  # TinyLlama load + first-run HF download can take a while
 
+WARMUP_REQUESTS = 3  # fired once per server start, discarded, so CUDA kernel
+WARMUP_MAX_NEW_TOKENS = 8  # warmup (cudnn autotune, first-call JIT) doesn't pollute real measurements
+
 # Two synthetic traffic classes so PRIORITY and EDF have something real to
-# differentiate on. Fixed seed -> every (policy, concurrency) run generates
-# the identical sequence of request types, so the comparison across policies
-# isn't confounded by different random loads.
+# differentiate on. Fixed seed -> every (policy, concurrency, repeat) run
+# generates the identical sequence of request types, so the comparison
+# across policies isn't confounded by different random loads.
 REQUEST_MIX_SEED = 1234
 INTERACTIVE_SHARE = 0.3
 INTERACTIVE_PRIORITY, INTERACTIVE_DEADLINE_MS = 15, 800
@@ -81,9 +98,17 @@ def _make_request(rng: random.Random, i: int) -> tuple[str, int, int, str]:
     )
 
 
+def _request_stream(num_requests: int) -> list[tuple[str, int, int, str]]:
+    """The fixed-seed request sequence for one run - identical across every
+    policy, concurrency level, and repeat, so comparisons aren't confounded
+    by different random loads."""
+    rng = random.Random(REQUEST_MIX_SEED)
+    return [_make_request(rng, i) for i in range(num_requests)]
+
+
 @dataclass
 class RunResult:
-    """Everything measured for one (policy, concurrency) combination."""
+    """Everything measured for one (policy, concurrency) run."""
 
     policy: str
     concurrency: int
@@ -100,6 +125,7 @@ class RunResult:
     queue_times_ms: list[float] = field(default_factory=list)
     compute_times_ms: list[float] = field(default_factory=list)
     batch_sizes: list[int] = field(default_factory=list)
+    output_tokens: list[int] = field(default_factory=list)
 
     @staticmethod
     def _percentile(data: list[float], p: float) -> float:
@@ -109,19 +135,50 @@ class RunResult:
         idx = int(len(ordered) * p / 100)
         return ordered[min(idx, len(ordered) - 1)]
 
+    def record(self, elapsed_ms: float, payload: Optional[dict], deadline_ms: int, traffic_class: str) -> None:
+        """Tally one completed request (success or failure) into this run."""
+        if traffic_class == "interactive":
+            self.interactive_total += 1
+        else:
+            self.batch_total += 1
+
+        if payload is None:
+            self.error_count += 1
+            return
+
+        self.success_count += 1
+        self.latencies_ms.append(elapsed_ms)
+        self.queue_times_ms.append(payload["queue_time_ms"])
+        self.compute_times_ms.append(payload["compute_time_ms"])
+        self.batch_sizes.append(payload["batch_size"])
+        self.output_tokens.append(payload["output_tokens"])
+
+        # Deadline success is judged on client-observed latency, not the
+        # server's internal queue+compute view - that's the whole point
+        # of measuring elapsed_ms at all.
+        if elapsed_ms <= deadline_ms:
+            self.deadline_hits += 1
+            if traffic_class == "interactive":
+                self.interactive_hits += 1
+            else:
+                self.batch_hits += 1
+
     def to_row(self) -> dict:
+        requests_per_sec = self.success_count / self.total_time_s if self.total_time_s > 0 else 0.0
+        deadline_met_fraction = self.deadline_hits / self.num_requests if self.num_requests else 0.0
         return {
             "policy": self.policy,
             "concurrency": self.concurrency,
             "num_requests": self.num_requests,
             "success_count": self.success_count,
             "error_count": self.error_count,
-            "requests_per_sec": (
-                self.success_count / self.total_time_s if self.total_time_s > 0 else 0.0
+            "requests_per_sec": requests_per_sec,
+            "tokens_per_sec": (
+                sum(self.output_tokens) / self.total_time_s if self.total_time_s > 0 else 0.0
             ),
-            "deadline_met_pct": (
-                100.0 * self.deadline_hits / self.num_requests if self.num_requests else 0.0
-            ),
+            "avg_output_tokens": statistics.mean(self.output_tokens) if self.output_tokens else 0.0,
+            "goodput_req_per_sec": requests_per_sec * deadline_met_fraction,
+            "deadline_met_pct": 100.0 * deadline_met_fraction,
             "deadline_met_pct_interactive": (
                 100.0 * self.interactive_hits / self.interactive_total if self.interactive_total else 0.0
             ),
@@ -167,62 +224,105 @@ async def _one_request(
         return None
 
 
-async def run_one(
+async def warmup(num_requests: int = WARMUP_REQUESTS, max_new_tokens: int = WARMUP_MAX_NEW_TOKENS) -> None:
+    """Fire a few throwaway requests right after server start, discarded, so
+    CUDA kernel warmup (cudnn autotune, first-call JIT) doesn't land inside
+    the first real measurement - a cold first request can run several times
+    slower than a warm one."""
+    async with httpx.AsyncClient() as client:
+        for i in range(num_requests):
+            await _one_request(client, f"Warmup {i}: hello.", max_new_tokens, priority=5, deadline_ms=5000)
+
+
+async def run_virtual(
     policy: str,
     concurrency: int,
     num_requests: int,
     max_new_tokens: int,
 ) -> RunResult:
-    """Fire num_requests requests at the (already running) server, bounded by a semaphore."""
+    """Virtual-user load: `concurrency` workers, each looping
+    send -> await response -> send next, pulling from the same fixed-seed
+    stream until num_requests total have completed. No artificial queue
+    beyond genuine concurrency - a worker's next send only happens once
+    its previous response actually arrived."""
+    result = RunResult(policy=policy, concurrency=concurrency, num_requests=num_requests)
+    request_stream = _request_stream(num_requests)
+    next_index = 0
+
+    def _next_params() -> Optional[tuple[str, int, int, str]]:
+        nonlocal next_index
+        if next_index >= len(request_stream):
+            return None
+        params = request_stream[next_index]
+        next_index += 1
+        return params
+
+    async def worker(client: httpx.AsyncClient) -> None:
+        while True:
+            params = _next_params()
+            if params is None:
+                return
+            prompt, priority, deadline_ms, traffic_class = params
+            start = time.perf_counter()
+            payload = await _one_request(client, prompt, max_new_tokens, priority, deadline_ms)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            result.record(elapsed_ms, payload, deadline_ms, traffic_class)
+
+    start = time.perf_counter()
+    async with httpx.AsyncClient() as client:
+        workers = [asyncio.create_task(worker(client)) for _ in range(concurrency)]
+        await asyncio.gather(*workers)
+    result.total_time_s = time.perf_counter() - start
+
+    return result
+
+
+async def run_burst(
+    policy: str,
+    concurrency: int,
+    num_requests: int,
+    max_new_tokens: int,
+) -> RunResult:
+    """Burst load (legacy default): all num_requests created at once, gated
+    through a semaphore of size `concurrency`. At low concurrency, most
+    requests sit in a long client-side line before their turn even starts -
+    that wait is included in their latency (submit -> response, full stop),
+    which is why burst mode and virtual-user mode give very different
+    numbers at the same "concurrency" value. Kept for comparison."""
     result = RunResult(policy=policy, concurrency=concurrency, num_requests=num_requests)
     semaphore = asyncio.Semaphore(concurrency)
+    request_stream = _request_stream(num_requests)
 
-    # Precomputed synchronously, before any concurrency starts, so the sequence
-    # of request types is identical across every (policy, concurrency) run.
-    rng = random.Random(REQUEST_MIX_SEED)
-    request_params = [_make_request(rng, i) for i in range(num_requests)]
-
-    async def bounded(client: httpx.AsyncClient, i: int) -> tuple[float, Optional[dict], int, str]:
-        prompt, priority, deadline_ms, traffic_class = request_params[i]
-        # Client latency means submit -> response, full stop - timer starts
-        # before the semaphore, so time spent queued in THIS client (waiting
-        # for a concurrency slot) counts too, not just time on the wire.
+    async def bounded(client: httpx.AsyncClient, i: int) -> None:
+        prompt, priority, deadline_ms, traffic_class = request_stream[i]
         start = time.perf_counter()
         async with semaphore:
             payload = await _one_request(client, prompt, max_new_tokens, priority, deadline_ms)
         elapsed_ms = (time.perf_counter() - start) * 1000
-        return elapsed_ms, payload, deadline_ms, traffic_class
+        result.record(elapsed_ms, payload, deadline_ms, traffic_class)
 
     start = time.perf_counter()
     async with httpx.AsyncClient() as client:
         tasks = [bounded(client, i) for i in range(num_requests)]
-        for coro in asyncio.as_completed(tasks):
-            elapsed_ms, payload, deadline_ms, traffic_class = await coro
-            if traffic_class == "interactive":
-                result.interactive_total += 1
-            else:
-                result.batch_total += 1
-
-            if payload is not None:
-                result.success_count += 1
-                result.latencies_ms.append(elapsed_ms)
-                result.queue_times_ms.append(payload["queue_time_ms"])
-                result.compute_times_ms.append(payload["compute_time_ms"])
-                result.batch_sizes.append(payload["batch_size"])
-                # Deadline success is judged on client-observed latency, not
-                # the server's internal queue+compute view - that's the
-                # whole point of measuring elapsed_ms at all.
-                if elapsed_ms <= deadline_ms:
-                    result.deadline_hits += 1
-                    if traffic_class == "interactive":
-                        result.interactive_hits += 1
-                    else:
-                        result.batch_hits += 1
-            else:
-                result.error_count += 1
-
+        await asyncio.gather(*tasks)
     result.total_time_s = time.perf_counter() - start
+
     return result
+
+
+LOAD_MODELS = {"virtual": run_virtual, "burst": run_burst}
+
+
+def _median_row(rows: list[dict], key: str = "requests_per_sec") -> dict:
+    """Pick the whole row whose `key` is the median among repeats.
+
+    Keeps every column internally consistent - all from one real run -
+    rather than averaging each column independently across repeats, which
+    could produce a row that never actually happened (e.g. one repeat's
+    queue time paired with a different repeat's throughput).
+    """
+    ordered = sorted(rows, key=lambda r: r[key])
+    return ordered[len(ordered) // 2]
 
 
 def start_server(policy: str) -> subprocess.Popen:
@@ -271,28 +371,40 @@ async def sweep(
     concurrencies: list[int],
     num_requests: int,
     max_new_tokens: int,
+    load_model: str,
+    repeats: int,
 ) -> list[dict]:
-    """Run every (policy, concurrency) combination, restarting the server once per policy."""
+    """Run every (policy, concurrency) combination, restarting the server once
+    per policy, repeating each combination `repeats` times and keeping the
+    median run."""
+    run_fn = LOAD_MODELS[load_model]
     rows = []
     for policy in policies:
         print(f"\n=== Starting server with SCHEDULING_POLICY={policy} ===")
         process = start_server(policy)
         try:
             wait_for_server()
-            print("Server ready.")
+            print("Server ready, warming up...")
+            await warmup()
+            print("Warmup complete.")
 
             for concurrency in concurrencies:
-                print(f"  policy={policy} concurrency={concurrency} requests={num_requests}")
-                result = await run_one(policy, concurrency, num_requests, max_new_tokens)
-                row = result.to_row()
+                print(f"  policy={policy} concurrency={concurrency} requests={num_requests} repeats={repeats}")
+                repeat_rows = []
+                for _ in range(repeats):
+                    result = await run_fn(policy, concurrency, num_requests, max_new_tokens)
+                    repeat_rows.append(result.to_row())
+
+                row = _median_row(repeat_rows)
                 rows.append(row)
                 print(
-                    f"    p50={row['latency_p50_ms']:.1f}ms  p99={row['latency_p99_ms']:.1f}ms  "
-                    f"req/s={row['requests_per_sec']:.2f}  avg_batch={row['avg_batch_size']:.1f}  "
+                    f"    [median of {repeats}] p50={row['latency_p50_ms']:.1f}ms  p99={row['latency_p99_ms']:.1f}ms  "
+                    f"req/s={row['requests_per_sec']:.2f}  tok/s={row['tokens_per_sec']:.1f}  "
+                    f"goodput={row['goodput_req_per_sec']:.2f}  avg_batch={row['avg_batch_size']:.1f}  "
                     f"deadline_met interactive={row['deadline_met_pct_interactive']:.1f}% "
                     f"batch={row['deadline_met_pct_batch']:.1f}%  "
                     f"queue_avg={row['queue_time_avg_ms']:.1f}ms  queue_p99={row['queue_time_p99_ms']:.1f}ms  "
-                    f"errors={result.error_count}"
+                    f"errors={row['error_count']}"
                 )
         finally:
             stop_server(process)
@@ -307,7 +419,17 @@ def main() -> None:
     parser.add_argument("--policies", default="fifo,priority,edf", help="Comma-separated policies")
     parser.add_argument("--concurrencies", default="1,2,4,8,16", help="Comma-separated concurrency levels")
     parser.add_argument(
-        "--requests", "-n", type=int, default=100, help="Requests per (policy, concurrency) combination"
+        "--requests", "-n", type=int, default=200, help="Requests per (policy, concurrency) combination"
+    )
+    parser.add_argument(
+        "--repeats", type=int, default=3, help="Repeats per combination; the median run is kept"
+    )
+    parser.add_argument(
+        "--load-model",
+        choices=["virtual", "burst"],
+        default="virtual",
+        help="virtual = N workers looping send/await/send-next (default); "
+        "burst = all requests created at once, gated by a semaphore",
     )
     parser.add_argument("--max-new-tokens", type=int, default=32, help="max_new_tokens per request")
     parser.add_argument("--output", "-o", default="results.csv", help="CSV output path")
@@ -318,10 +440,13 @@ def main() -> None:
 
     print(
         f"Sweeping {len(policies)} policies x {len(concurrencies)} concurrency levels "
-        f"({len(policies) * len(concurrencies)} runs, {args.requests} requests each)"
+        f"({len(policies) * len(concurrencies)} cells, {args.repeats} repeats each, "
+        f"{args.requests} requests per repeat, load_model={args.load_model})"
     )
 
-    rows = asyncio.run(sweep(policies, concurrencies, args.requests, args.max_new_tokens))
+    rows = asyncio.run(
+        sweep(policies, concurrencies, args.requests, args.max_new_tokens, args.load_model, args.repeats)
+    )
 
     output_path = Path(args.output)
     write_csv(rows, output_path)
