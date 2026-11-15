@@ -10,8 +10,17 @@ server.py), sweeping policies means restarting the server - this script
 does that itself, once per policy, and reuses that one running server
 across all of that policy's concurrency levels. One command runs the
 whole sweep and writes one row per (policy, concurrency) combination
-to CSV: latency percentiles, throughput, and the queue-time vs
-compute-time split the server reports for every request.
+to CSV: latency percentiles, throughput, deadline-hit rate, and the
+queue-time vs compute-time split the server reports for every request.
+
+Every request is tagged as one of two synthetic traffic classes -
+"interactive" (high priority, tight deadline) or "batch" (low priority,
+relaxed deadline) - using a fixed random seed, so PRIORITY and EDF have
+something real to schedule on. Without this, every request would look
+identical and all three policies would just tie-break to arrival order
+(i.e. behave exactly like FIFO). The same seed means every (policy,
+concurrency) run sees the identical request stream, so differences in
+the results come from the policy, not from random variation in load.
 
 Usage:
     # Default sweep: 3 policies x 5 concurrency levels, one command.
@@ -31,6 +40,7 @@ import argparse
 import asyncio
 import csv
 import os
+import random
 import statistics
 import subprocess
 import sys
@@ -44,6 +54,30 @@ import httpx
 SERVER_URL = "http://127.0.0.1:8000"  # not "localhost": Windows httpx tries ::1 first and stalls ~2s before IPv4 fallback
 STARTUP_TIMEOUT_S = 180.0  # TinyLlama load + first-run HF download can take a while
 
+# Two synthetic traffic classes so PRIORITY and EDF have something real to
+# differentiate on. Fixed seed -> every (policy, concurrency) run generates
+# the identical sequence of request types, so the comparison across policies
+# isn't confounded by different random loads.
+REQUEST_MIX_SEED = 1234
+INTERACTIVE_SHARE = 0.3
+INTERACTIVE_PRIORITY, INTERACTIVE_DEADLINE_MS = 15, 800
+BATCH_PRIORITY, BATCH_DEADLINE_MS = 3, 8000
+
+
+def _make_request(rng: random.Random, i: int) -> tuple[str, int, int]:
+    """Return (prompt, priority, deadline_ms) for request i from the fixed two-class mix."""
+    if rng.random() < INTERACTIVE_SHARE:
+        return (
+            f"Interactive {i}: answer in one short sentence - what color is the sky?",
+            INTERACTIVE_PRIORITY,
+            INTERACTIVE_DEADLINE_MS,
+        )
+    return (
+        f"Batch {i}: tell me something interesting about space.",
+        BATCH_PRIORITY,
+        BATCH_DEADLINE_MS,
+    )
+
 
 @dataclass
 class RunResult:
@@ -54,6 +88,7 @@ class RunResult:
     num_requests: int
     success_count: int = 0
     error_count: int = 0
+    deadline_hits: int = 0
     total_time_s: float = 0.0
     latencies_ms: list[float] = field(default_factory=list)
     queue_times_ms: list[float] = field(default_factory=list)
@@ -78,11 +113,17 @@ class RunResult:
             "requests_per_sec": (
                 self.success_count / self.total_time_s if self.total_time_s > 0 else 0.0
             ),
+            "deadline_met_pct": (
+                100.0 * self.deadline_hits / self.num_requests if self.num_requests else 0.0
+            ),
             "latency_p50_ms": self._percentile(self.latencies_ms, 50),
             "latency_p95_ms": self._percentile(self.latencies_ms, 95),
             "latency_p99_ms": self._percentile(self.latencies_ms, 99),
             "latency_avg_ms": statistics.mean(self.latencies_ms) if self.latencies_ms else 0.0,
             "queue_time_avg_ms": statistics.mean(self.queue_times_ms) if self.queue_times_ms else 0.0,
+            "queue_time_p50_ms": self._percentile(self.queue_times_ms, 50),
+            "queue_time_p95_ms": self._percentile(self.queue_times_ms, 95),
+            "queue_time_p99_ms": self._percentile(self.queue_times_ms, 99),
             "compute_time_avg_ms": statistics.mean(self.compute_times_ms) if self.compute_times_ms else 0.0,
             "avg_batch_size": statistics.mean(self.batch_sizes) if self.batch_sizes else 0.0,
         }
@@ -92,13 +133,20 @@ async def _one_request(
     client: httpx.AsyncClient,
     prompt: str,
     max_new_tokens: int,
+    priority: int,
+    deadline_ms: int,
 ) -> tuple[float, Optional[dict]]:
     """Fire one request, return (client-measured latency_ms, response JSON or None on failure)."""
     start = time.perf_counter()
     try:
         response = await client.post(
             f"{SERVER_URL}/generate",
-            json={"prompt": prompt, "max_new_tokens": max_new_tokens},
+            json={
+                "prompt": prompt,
+                "max_new_tokens": max_new_tokens,
+                "priority": priority,
+                "deadline_ms": deadline_ms,
+            },
             timeout=60.0,
         )
         elapsed_ms = (time.perf_counter() - start) * 1000
@@ -120,23 +168,33 @@ async def run_one(
     result = RunResult(policy=policy, concurrency=concurrency, num_requests=num_requests)
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def bounded(client: httpx.AsyncClient, i: int) -> tuple[float, Optional[dict]]:
+    # Precomputed synchronously, before any concurrency starts, so the sequence
+    # of request types is identical across every (policy, concurrency) run.
+    rng = random.Random(REQUEST_MIX_SEED)
+    request_params = [_make_request(rng, i) for i in range(num_requests)]
+
+    async def bounded(client: httpx.AsyncClient, i: int) -> tuple[float, Optional[dict], int]:
+        prompt, priority, deadline_ms = request_params[i]
         async with semaphore:
-            return await _one_request(
-                client, f"Request {i}: tell me something interesting about space.", max_new_tokens
+            elapsed_ms, payload = await _one_request(
+                client, prompt, max_new_tokens, priority, deadline_ms
             )
+            return elapsed_ms, payload, deadline_ms
 
     start = time.perf_counter()
     async with httpx.AsyncClient() as client:
         tasks = [bounded(client, i) for i in range(num_requests)]
         for coro in asyncio.as_completed(tasks):
-            elapsed_ms, payload = await coro
+            elapsed_ms, payload, deadline_ms = await coro
             if payload is not None:
                 result.success_count += 1
                 result.latencies_ms.append(elapsed_ms)
                 result.queue_times_ms.append(payload["queue_time_ms"])
                 result.compute_times_ms.append(payload["compute_time_ms"])
                 result.batch_sizes.append(payload["batch_size"])
+                total_time_ms = payload["queue_time_ms"] + payload["compute_time_ms"]
+                if total_time_ms <= deadline_ms:
+                    result.deadline_hits += 1
             else:
                 result.error_count += 1
 
@@ -208,6 +266,8 @@ async def sweep(
                 print(
                     f"    p50={row['latency_p50_ms']:.1f}ms  p99={row['latency_p99_ms']:.1f}ms  "
                     f"req/s={row['requests_per_sec']:.2f}  avg_batch={row['avg_batch_size']:.1f}  "
+                    f"deadline_met={row['deadline_met_pct']:.1f}%  "
+                    f"queue_avg={row['queue_time_avg_ms']:.1f}ms  queue_p99={row['queue_time_p99_ms']:.1f}ms  "
                     f"errors={result.error_count}"
                 )
         finally:
