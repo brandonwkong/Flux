@@ -64,18 +64,20 @@ INTERACTIVE_PRIORITY, INTERACTIVE_DEADLINE_MS = 15, 800
 BATCH_PRIORITY, BATCH_DEADLINE_MS = 3, 8000
 
 
-def _make_request(rng: random.Random, i: int) -> tuple[str, int, int]:
-    """Return (prompt, priority, deadline_ms) for request i from the fixed two-class mix."""
+def _make_request(rng: random.Random, i: int) -> tuple[str, int, int, str]:
+    """Return (prompt, priority, deadline_ms, traffic_class) for request i from the fixed two-class mix."""
     if rng.random() < INTERACTIVE_SHARE:
         return (
             f"Interactive {i}: answer in one short sentence - what color is the sky?",
             INTERACTIVE_PRIORITY,
             INTERACTIVE_DEADLINE_MS,
+            "interactive",
         )
     return (
         f"Batch {i}: tell me something interesting about space.",
         BATCH_PRIORITY,
         BATCH_DEADLINE_MS,
+        "batch",
     )
 
 
@@ -89,6 +91,10 @@ class RunResult:
     success_count: int = 0
     error_count: int = 0
     deadline_hits: int = 0
+    interactive_total: int = 0
+    interactive_hits: int = 0
+    batch_total: int = 0
+    batch_hits: int = 0
     total_time_s: float = 0.0
     latencies_ms: list[float] = field(default_factory=list)
     queue_times_ms: list[float] = field(default_factory=list)
@@ -116,6 +122,12 @@ class RunResult:
             "deadline_met_pct": (
                 100.0 * self.deadline_hits / self.num_requests if self.num_requests else 0.0
             ),
+            "deadline_met_pct_interactive": (
+                100.0 * self.interactive_hits / self.interactive_total if self.interactive_total else 0.0
+            ),
+            "deadline_met_pct_batch": (
+                100.0 * self.batch_hits / self.batch_total if self.batch_total else 0.0
+            ),
             "latency_p50_ms": self._percentile(self.latencies_ms, 50),
             "latency_p95_ms": self._percentile(self.latencies_ms, 95),
             "latency_p99_ms": self._percentile(self.latencies_ms, 99),
@@ -135,9 +147,8 @@ async def _one_request(
     max_new_tokens: int,
     priority: int,
     deadline_ms: int,
-) -> tuple[float, Optional[dict]]:
-    """Fire one request, return (client-measured latency_ms, response JSON or None on failure)."""
-    start = time.perf_counter()
+) -> Optional[dict]:
+    """Fire one request, return response JSON or None on failure."""
     try:
         response = await client.post(
             f"{SERVER_URL}/generate",
@@ -149,13 +160,11 @@ async def _one_request(
             },
             timeout=60.0,
         )
-        elapsed_ms = (time.perf_counter() - start) * 1000
         if response.status_code == 200:
-            return elapsed_ms, response.json()
-        return elapsed_ms, None
+            return response.json()
+        return None
     except Exception:
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        return elapsed_ms, None
+        return None
 
 
 async def run_one(
@@ -173,28 +182,42 @@ async def run_one(
     rng = random.Random(REQUEST_MIX_SEED)
     request_params = [_make_request(rng, i) for i in range(num_requests)]
 
-    async def bounded(client: httpx.AsyncClient, i: int) -> tuple[float, Optional[dict], int]:
-        prompt, priority, deadline_ms = request_params[i]
+    async def bounded(client: httpx.AsyncClient, i: int) -> tuple[float, Optional[dict], int, str]:
+        prompt, priority, deadline_ms, traffic_class = request_params[i]
+        # Client latency means submit -> response, full stop - timer starts
+        # before the semaphore, so time spent queued in THIS client (waiting
+        # for a concurrency slot) counts too, not just time on the wire.
+        start = time.perf_counter()
         async with semaphore:
-            elapsed_ms, payload = await _one_request(
-                client, prompt, max_new_tokens, priority, deadline_ms
-            )
-            return elapsed_ms, payload, deadline_ms
+            payload = await _one_request(client, prompt, max_new_tokens, priority, deadline_ms)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        return elapsed_ms, payload, deadline_ms, traffic_class
 
     start = time.perf_counter()
     async with httpx.AsyncClient() as client:
         tasks = [bounded(client, i) for i in range(num_requests)]
         for coro in asyncio.as_completed(tasks):
-            elapsed_ms, payload, deadline_ms = await coro
+            elapsed_ms, payload, deadline_ms, traffic_class = await coro
+            if traffic_class == "interactive":
+                result.interactive_total += 1
+            else:
+                result.batch_total += 1
+
             if payload is not None:
                 result.success_count += 1
                 result.latencies_ms.append(elapsed_ms)
                 result.queue_times_ms.append(payload["queue_time_ms"])
                 result.compute_times_ms.append(payload["compute_time_ms"])
                 result.batch_sizes.append(payload["batch_size"])
-                total_time_ms = payload["queue_time_ms"] + payload["compute_time_ms"]
-                if total_time_ms <= deadline_ms:
+                # Deadline success is judged on client-observed latency, not
+                # the server's internal queue+compute view - that's the
+                # whole point of measuring elapsed_ms at all.
+                if elapsed_ms <= deadline_ms:
                     result.deadline_hits += 1
+                    if traffic_class == "interactive":
+                        result.interactive_hits += 1
+                    else:
+                        result.batch_hits += 1
             else:
                 result.error_count += 1
 
@@ -266,7 +289,8 @@ async def sweep(
                 print(
                     f"    p50={row['latency_p50_ms']:.1f}ms  p99={row['latency_p99_ms']:.1f}ms  "
                     f"req/s={row['requests_per_sec']:.2f}  avg_batch={row['avg_batch_size']:.1f}  "
-                    f"deadline_met={row['deadline_met_pct']:.1f}%  "
+                    f"deadline_met interactive={row['deadline_met_pct_interactive']:.1f}% "
+                    f"batch={row['deadline_met_pct_batch']:.1f}%  "
                     f"queue_avg={row['queue_time_avg_ms']:.1f}ms  queue_p99={row['queue_time_p99_ms']:.1f}ms  "
                     f"errors={result.error_count}"
                 )
