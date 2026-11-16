@@ -1,11 +1,11 @@
-"""The engine: owns the model, the batch loop, and the queue/compute timing split.
+"""The engine: owns the model, the continuous batch loop, and the queue/compute timing split.
 
-Batching lives here, not in a separate pre-worker stage. Each pass through
-the loop decides how many pending requests to pull (the scheduler's job),
-pads and runs them through the model together in one forward pass (the
-batching), and times the two phases separately so the split in
-GenerateResponse is honest: queue_time_ms is how long a request sat waiting,
-compute_time_ms is how long the shared forward pass actually took.
+Continuous (iteration-level) batching: between every single decode step,
+the loop admits pending requests (up to free capacity, in the scheduler's
+chosen order) and evicts anyone who just finished, resolving their Future
+immediately - not at the end of some larger, shared batch everyone had to
+wait for. See docs/continuous_batching_notes.md for how this replaced the
+old static-batching loop, step by step.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from typing import Optional
 import structlog
 import torch
 
+from flux.decode import ContinuousBatch
 from flux.queue import QueuedRequest, RequestQueue
 from flux.scheduler import SchedulingPolicy, select_batch
 from flux.schemas import GenerateResponse
@@ -24,40 +25,45 @@ from flux.schemas import GenerateResponse
 logger = structlog.get_logger()
 
 DEFAULT_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-POLL_INTERVAL_S = 0.001
 
 
 class Engine:
-    """Loads one model onto one GPU and runs the batch loop against one queue."""
+    """Loads one model onto one GPU and runs the continuous batch loop against one queue."""
 
     def __init__(
         self,
         queue: RequestQueue,
         model_name: str = DEFAULT_MODEL,
         max_batch_size: int = 8,
-        max_wait_ms: float = 20.0,
         policy: SchedulingPolicy = SchedulingPolicy.FIFO,
         device: Optional[str] = None,
     ) -> None:
         self.queue = queue
         self.model_name = model_name
         self.max_batch_size = max_batch_size
-        self.max_wait_s = max_wait_ms / 1000
         self.policy = policy
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         self._tokenizer = None
         self._model = None
+        self._batch: Optional[ContinuousBatch] = None
         self._running = False
         self._loop_task: Optional[asyncio.Task] = None
 
+        # Per-active-sequence bookkeeping, keyed by QueuedRequest.id (used
+        # directly as ContinuousBatch's seq_id too - one id, one meaning).
+        self._requests_by_id: dict[str, QueuedRequest] = {}
+        self._admitted_at: dict[str, float] = {}
+        self._batch_size_at_admission: dict[str, int] = {}
+
     async def start(self) -> None:
-        """Load the model (blocking, so it runs off the event loop thread) and start the batch loop."""
+        """Load the model (blocking, so it runs off the event loop thread) and start the loop."""
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self._load_model)
 
+        self._batch = ContinuousBatch(self._model, self._tokenizer, self.device)
         self._running = True
-        self._loop_task = asyncio.create_task(self._batch_loop())
+        self._loop_task = asyncio.create_task(self._run_loop())
         logger.info(
             "engine_started",
             model=self.model_name,
@@ -67,7 +73,7 @@ class Engine:
         )
 
     async def stop(self) -> None:
-        """Stop the batch loop."""
+        """Stop the loop."""
         self._running = False
         if self._loop_task:
             self._loop_task.cancel()
@@ -83,106 +89,96 @@ class Engine:
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         if self._tokenizer.pad_token is None:
             self._tokenizer.pad_token = self._tokenizer.eos_token
-        # Left padding so every sequence's last real token lands in the same
-        # column - generate() continues from that column for all of them.
-        self._tokenizer.padding_side = "left"
 
         dtype = torch.float16 if self.device == "cuda" else torch.float32
         self._model = AutoModelForCausalLM.from_pretrained(self.model_name, torch_dtype=dtype)
         self._model.to(self.device)
         self._model.eval()
 
-    async def _batch_loop(self) -> None:
-        """Wait for requests, give stragglers a short window to join, then run a batch."""
+    async def _run_loop(self) -> None:
+        """Every iteration: admit as many pending requests as fit (the
+        scheduler decides which ones, same policies as before - just
+        deciding admission order now instead of whole-batch composition
+        once per generation), run one decode step, resolve anyone who
+        just finished."""
+        loop = asyncio.get_event_loop()
         while self._running:
             try:
-                await self.queue.wait_for_arrival(timeout=1.0)
-                if self.queue.depth == 0:
-                    continue
+                await self._admit_pending(loop)
 
-                deadline = time.perf_counter() + self.max_wait_s
-                while self.queue.depth < self.max_batch_size and time.perf_counter() < deadline:
-                    await asyncio.sleep(POLL_INTERVAL_S)
-
-                pending = self.queue.snapshot()
-                if not pending:
-                    continue
-
-                batch = select_batch(pending, self.max_batch_size, self.policy)
-                self.queue.remove(batch)
-                await self._run_batch(batch)
+                if self._batch.active_count > 0:
+                    finished = await loop.run_in_executor(None, self._batch.step)
+                    self._resolve_finished(finished)
+                else:
+                    await self.queue.wait_for_arrival(timeout=1.0)
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("batch_loop_error", error=str(e))
+                logger.error("engine_loop_error", error=str(e))
                 await asyncio.sleep(0.1)
 
-    async def _run_batch(self, batch: list[QueuedRequest]) -> None:
-        """Run one batch through the model and resolve every request's Future."""
-        compute_start = time.perf_counter()
-        queue_times_ms = [(compute_start - r.arrived_at) * 1000 for r in batch]
-
-        loop = asyncio.get_event_loop()
-        try:
-            generations = await loop.run_in_executor(None, self._generate, batch)
-        except Exception as e:
-            logger.error("generate_error", error=str(e), batch_size=len(batch))
-            for request in batch:
-                if not request.future.done():
-                    request.future.set_exception(e)
+    async def _admit_pending(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Pull in pending requests up to free capacity, in the scheduler's order."""
+        free_slots = self.max_batch_size - self._batch.active_count
+        if free_slots <= 0:
             return
 
-        compute_time_ms = (time.perf_counter() - compute_start) * 1000
+        pending = self.queue.snapshot()
+        if not pending:
+            return
 
-        for request, (text, output_tokens), queue_time_ms in zip(batch, generations, queue_times_ms):
+        to_admit = select_batch(pending, free_slots, self.policy)
+        self.queue.remove(to_admit)
+
+        for request in to_admit:
+            # Timestamp BEFORE the (blocking, possibly slow-on-cold-cache)
+            # prefill call, not after - admission means "entered the active
+            # set," and the prefill compute itself belongs to compute_time,
+            # not queue_time. Recording it after would silently move real
+            # compute cost into the wait-time number.
+            admitted_at = time.perf_counter()
+            try:
+                await loop.run_in_executor(
+                    None, self._batch.admit, request.id, request.prompt, request.max_new_tokens
+                )
+            except Exception as e:
+                logger.error("admit_error", error=str(e), request_id=request.id)
+                if not request.future.done():
+                    request.future.set_exception(e)
+                continue
+
+            self._requests_by_id[request.id] = request
+            self._admitted_at[request.id] = admitted_at
+            self._batch_size_at_admission[request.id] = self._batch.active_count
+
+    def _resolve_finished(self, finished: list[tuple[str, str, int]]) -> None:
+        """Resolve each just-finished sequence's Future the moment it finishes.
+
+        queue_time_ms: arrival into the queue -> admission into the active
+        set. compute_time_ms: admission -> this finish. Both now genuinely
+        per-sequence - no longer a value shared across a whole batch,
+        because there's no longer a "whole batch" that starts and ends
+        together.
+
+        batch_size: a provisional choice for Step 3, flagged as such -
+        the number of active sequences at the moment THIS request was
+        admitted. Step 4 revisits what this field should mean now.
+        """
+        now = time.perf_counter()
+        for seq_id, text, output_tokens in finished:
+            request = self._requests_by_id.pop(seq_id, None)
+            admitted_at = self._admitted_at.pop(seq_id, None)
+            batch_size = self._batch_size_at_admission.pop(seq_id, 1)
+            if request is None or admitted_at is None:
+                continue
+
             if not request.future.done():
                 request.future.set_result(
                     GenerateResponse(
                         text=text,
-                        queue_time_ms=queue_time_ms,
-                        compute_time_ms=compute_time_ms,
-                        batch_size=len(batch),
+                        queue_time_ms=(admitted_at - request.arrived_at) * 1000,
+                        compute_time_ms=(now - admitted_at) * 1000,
+                        batch_size=batch_size,
                         output_tokens=output_tokens,
                     )
                 )
-
-    def _generate(self, batch: list[QueuedRequest]) -> list[tuple[str, int]]:
-        """Blocking: tokenize, pad, run one shared forward pass, decode each request's share.
-
-        Returns (text, output_tokens) per request. output_tokens counts real
-        generated tokens up to the first EOS, not max_new_tokens - a request
-        that finishes early still gets padded out to the batch's shared
-        max_new_tokens in the output tensor, so counting raw slice length
-        would overstate how much work this request actually caused.
-        """
-        inputs = self._tokenizer(
-            [r.prompt for r in batch],
-            return_tensors="pt",
-            padding=True,
-        )
-        input_ids = inputs["input_ids"].to(self.device)
-        attention_mask = inputs["attention_mask"].to(self.device)
-        input_len = input_ids.shape[1]
-
-        # One generate() call needs one max_new_tokens - use the largest ask in
-        # the batch, then truncate each sequence back down to what it asked for.
-        max_new_tokens = max(r.max_new_tokens for r in batch)
-
-        with torch.no_grad():
-            generated = self._model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                pad_token_id=self._tokenizer.pad_token_id,
-                do_sample=False,
-            )
-
-        eos_id = self._tokenizer.eos_token_id
-        results = []
-        for i, request in enumerate(batch):
-            new_tokens = generated[i, input_len : input_len + request.max_new_tokens]
-            eos_positions = (new_tokens == eos_id).nonzero(as_tuple=True)[0]
-            output_tokens = eos_positions[0].item() if len(eos_positions) > 0 else len(new_tokens)
-            text = self._tokenizer.decode(new_tokens, skip_special_tokens=True)
-            results.append((text, output_tokens))
-        return results

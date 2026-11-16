@@ -10,7 +10,7 @@ import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from flux.decode import generate_batch_fixed, generate_one
+from flux.decode import ContinuousBatch, generate_batch_fixed, generate_one
 
 MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
@@ -129,3 +129,65 @@ class TestBatchedDecodingMatchesGenerate:
 
         for (_, output_tokens), max_new_tokens in zip(results, max_new_tokens_list):
             assert output_tokens <= max_new_tokens
+
+
+class TestContinuousBatchMatchesGenerateOne:
+    """Step 3: dynamic membership - the actual continuous batching.
+
+    The invariant that matters here isn't "matches model.generate()" (no
+    single generate() call does what this does) - it's that admission and
+    eviction TIMING must never change WHAT a sequence generates, only WHEN
+    it finishes relative to the others. So the ground truth is Step 1's
+    generate_one(), already proven correct, run on each prompt alone.
+    """
+
+    def test_sequences_admitted_and_evicted_at_different_times_match_solo_generation(self, loaded_model):
+        model, tokenizer, device = loaded_model
+
+        # Staggered on purpose: different prompt lengths (so admission has
+        # to pad in both directions) and different max_new_tokens (so
+        # eviction happens at different steps for different rows).
+        requests = {
+            "A": ("The capital of France is", 8),
+            "B": ("Once upon a time, there was a brave knight who", 12),
+            "C": ("2 + 2 =", 6),
+        }
+
+        expected = {
+            seq_id: generate_one(model, tokenizer, prompt, max_new_tokens, device)
+            for seq_id, (prompt, max_new_tokens) in requests.items()
+        }
+
+        batch = ContinuousBatch(model, tokenizer, device)
+        finished: dict[str, tuple[str, int]] = {}
+
+        # Admit A alone, step twice so it's mid-generation.
+        batch.admit("A", *requests["A"])
+        for _ in range(2):
+            for seq_id, text, output_tokens in batch.step():
+                finished[seq_id] = (text, output_tokens)
+
+        # Admit B while A is still running (tests padding the new, longer
+        # prompt against an existing shorter batch and vice versa).
+        batch.admit("B", *requests["B"])
+        for _ in range(2):
+            for seq_id, text, output_tokens in batch.step():
+                finished[seq_id] = (text, output_tokens)
+
+        # Admit C while A and/or B may still be running.
+        batch.admit("C", *requests["C"])
+
+        # Run until everyone still active has finished.
+        while batch.active_count > 0:
+            for seq_id, text, output_tokens in batch.step():
+                finished[seq_id] = (text, output_tokens)
+
+        assert set(finished.keys()) == set(requests.keys())
+        for seq_id in requests:
+            expected_text, expected_tokens = expected[seq_id]
+            actual_text, actual_tokens = finished[seq_id]
+            assert actual_text == expected_text, (
+                f"Sequence {seq_id!r} text mismatch: "
+                f"continuous={actual_text!r} solo={expected_text!r}"
+            )
+            assert actual_tokens == expected_tokens

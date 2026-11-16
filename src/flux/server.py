@@ -25,7 +25,6 @@ logger = structlog.get_logger()
 
 MODEL_NAME = os.environ.get("FLUX_MODEL", DEFAULT_MODEL)
 MAX_BATCH_SIZE = int(os.environ.get("MAX_BATCH_SIZE", "8"))
-MAX_WAIT_MS = float(os.environ.get("MAX_WAIT_MS", "20"))
 MAX_QUEUE_DEPTH = int(os.environ.get("MAX_QUEUE_DEPTH", "1000"))
 SCHEDULING_POLICY = SchedulingPolicy(os.environ.get("SCHEDULING_POLICY", "fifo"))
 
@@ -35,7 +34,7 @@ engine: Optional[Engine] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup loads the model and starts the batch loop; shutdown stops it."""
+    """Startup loads the model and starts the continuous batch loop; shutdown stops it."""
     global queue, engine
 
     queue = RequestQueue(max_depth=MAX_QUEUE_DEPTH)
@@ -43,7 +42,6 @@ async def lifespan(app: FastAPI):
         queue=queue,
         model_name=MODEL_NAME,
         max_batch_size=MAX_BATCH_SIZE,
-        max_wait_ms=MAX_WAIT_MS,
         policy=SCHEDULING_POLICY,
     )
     await engine.start()

@@ -109,3 +109,97 @@ path, confirmed unchanged by booting it and hitting `/generate`.
   sequence just stops being recorded while still occupying its row,
   fed filler tokens, until Step 3 adds the ability to actually remove
   it from the tensor.
+
+## Step 3 - Dynamic membership (the actual continuous batching)
+
+**Concept.** Steps 1-2 proved the mechanics when membership is decided
+once, up front. Step 3 makes membership dynamic: between every single
+step, the engine can admit new requests into free slots and evict
+anyone who just finished - this is the whole point of the migration.
+Each iteration now does three things: admit (prefill a newly-admitted
+request, splice its KV cache into the batch), run one decode step for
+everyone active, evict (resolve finished requests' Futures immediately,
+slice them out of the cache). The scheduler's job changes shape:
+`select_batch` used to pick a whole batch once per generation; now it
+decides admission order every iteration, for however many slots are
+free (often zero) - same three policies, called far more often, each
+call much smaller-stakes.
+
+**What was built.**
+
+1. `ContinuousBatch` in `decode.py` - the low-level mechanics
+   (`admit()`, `step()`), deliberately with no knowledge of
+   `QueuedRequest` or `Future`. Uses plain padded-tensor batching: every
+   row left-padded to the longest active sequence's length, not a paged
+   KV cache like vLLM's PagedAttention. That's a real, stated
+   simplification - it wastes some memory/compute on padding - made to
+   keep the KV cache manipulation tractable to hand-write and verify by
+   hand; block-based paging is how production engines avoid that waste
+   and is out of scope here.
+2. `engine.py` rewritten around it: `_run_loop()` admits-then-steps every
+   iteration, `_resolve_finished()` resolves each sequence's Future the
+   moment it finishes. `max_wait_ms` is gone from `Engine`'s constructor
+   and `server.py`'s config - **flagging this as the one forced config
+   change**: it meant "wait for stragglers before running a batch,"
+   which has no meaning once admission happens every iteration. The
+   `/generate` HTTP contract is unchanged.
+
+**Two real bugs found and fixed while building this** - worth recording
+because both are the kind of thing that only shows up once membership
+is actually dynamic, not before:
+
+- **Position encoding mismatch.** First version of the correctness test
+  failed: three sequences admitted/evicted at staggered times produced
+  different text than running each alone, even though Steps 1-2's exact
+  same mechanics (minus dynamic admission) had passed cleanly. Root
+  cause: when sequence A's cache gets left-padded *after* some of its
+  tokens are already cached (because a longer sequence B joins later),
+  A's already-cached keys were rotated (RoPE) using A's real position
+  at the time they were computed - that's permanent, baked in, and
+  doesn't change just because padding was inserted in front of it
+  afterward. But the code was deriving every row's position implicitly
+  from the shared physical column count (`cache_position`), which
+  changes when padding changes. Fix: track each active sequence's own
+  logical position explicitly (ignoring its padding) and pass it as a
+  separate `position_ids` argument, distinct from the shared
+  `cache_position` used only for indexing into the cache tensor. Exact
+  match against solo generation after the fix.
+- **Queue time measured after the work it was supposed to exclude.**
+  Smoke-testing the live server showed `queue_time_ms` of ~760ms for a
+  single request on an otherwise idle server - should have been ~0.
+  Cause: the admission timestamp was recorded *after* `batch.admit()`
+  (the blocking prefill call) returned, not before - so any time spent
+  in that first, possibly cold-cache prefill call was silently counted
+  as "waiting in queue" instead of "doing the work." Fix: timestamp
+  before the blocking call, not after. Confirmed fixed: `queue_time_ms`
+  reads 0.0 on an idle server afterward, with the cold-start cost now
+  correctly showing up in `compute_time_ms` instead.
+
+**Live proof it actually works** (not just passing tests): fired a
+64-token request (A), then 300ms later, mid-A's-generation, an 8-token
+request (B). B's `queue_time_ms` was 58.6ms - admitted within about one
+loop iteration, not after waiting for A's whole ~2.9s generation - and
+B finished in 512ms total while A kept running independently
+(`batch_size=2` confirms they were genuinely sharing steps). That's the
+exact failure mode static batching had and continuous batching doesn't.
+
+**Checkpoint explanation (given, then paused for discussion):**
+
+- **One full step, in plain language.** At the top of every iteration:
+  (1) *Admit* - if there's free capacity, ask the scheduler which
+  pending requests should fill it (same FIFO/priority/EDF logic as
+  before, just choosing among whoever's waiting right now instead of
+  the whole next batch); prefill each one and splice it into the active
+  set. (2) *Run* - one decode step, together, for every sequence
+  currently active. (3) *Evict* - anyone whose last predicted token was
+  EOS or hit their own `max_new_tokens`: decode their text, resolve
+  their Future immediately, remove their row from the cache. Repeat.
+- **The policy's job changed shape, not its logic.** Under static
+  batching, `select_batch` ran once per *generation*, picking a whole
+  batch (up to 8) from everyone pending, and that batch was locked for
+  however long the slowest sequence in it took. Under continuous
+  batching, the exact same function runs every single *iteration*,
+  picking however many requests fit in whatever capacity just opened up
+  (often zero, sometimes one, rarely several) - a much higher-frequency,
+  lower-stakes decision. FIFO/priority/EDF didn't need to change at
+  all; what changed is how often, and over how much, they get asked.
