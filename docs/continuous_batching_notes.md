@@ -50,3 +50,62 @@ hitting `/generate` after this step.
   `past_key_values` for everything before it. This split - one expensive
   parallel pass, then many cheap sequential single-token passes - is
   the shape every later step builds on.
+
+## Step 2 - Batched decode, fixed membership
+
+**Concept.** Step 1 proved the single-token mechanic for one sequence.
+Step 2 runs several sequences through that same mechanic together, in
+one batched step loop - but membership is still *fixed* for the whole
+generation, exactly like static batching: everyone starts together, no
+one joins or leaves until Step 3. The new problem this step has to
+solve: sequences finish (hit their own `max_new_tokens`, or EOS) at
+different step counts, but the batch dimension is shared across every
+forward call - a finished sequence can't just disappear from the
+tensor.
+
+**What was built.** `generate_batch_fixed()` in `decode.py`: prefills a
+left-padded batch of prompts together, then loops decode steps across
+the whole batch. Each step, per sequence: if it's already finished,
+skip it; otherwise check whether this step's predicted token is EOS or
+pushes it past its own `max_new_tokens` budget, and if so mark it
+finished *without* recording that token. Finished sequences still get
+fed through the shared forward pass every subsequent step (with a
+throwaway filler token) so the tensor shapes stay valid - this costs
+wasted compute but causes no corruption, because each batch row's
+attention is computed independently; row i's keys/values are never
+mixed with row j's. This is exactly the same trick `model.generate()`
+already uses internally for a batch.
+
+Verified in `tests/test_decode.py` against `model.generate()` called on
+the *same padded batch* (mirroring the current production
+`engine.py._generate()`'s own convention: one `generate()` call at the
+batch's largest `max_new_tokens`, each row truncated back to its own
+request's budget). Deliberately used staggered `max_new_tokens`
+(`[4, 16, 10]`) across three prompts so the finish-at-different-times
+code path actually gets exercised, not just coincidentally skipped.
+Exact text match on every sequence. `engine.py`/`server.py` still
+untouched - the production server still runs the old static-batching
+path, confirmed unchanged by booting it and hitting `/generate`.
+
+**Checkpoint explanation (given, then paused for discussion):**
+
+- **How the batched KV cache is laid out.** Add a batch dimension to
+  what Step 1 already had: for every layer, the cache is shaped roughly
+  `(batch_size, num_heads, sequence_length, head_dim)`. Row `i` of that
+  batch dimension holds exactly what `generate_one()` would have built
+  for sequence `i` alone - there's no cross-talk between rows. That
+  independence is *why* padding a finished sequence with garbage can't
+  corrupt its neighbors: each row's attention only ever looks at that
+  row's own keys/values.
+
+- **What has to happen when sequences have different lengths.** Two
+  different kinds of "different length" show up, and they're handled
+  differently. (1) Different *prompt* lengths get left-padded to a
+  common width before prefill, same as the existing static path - the
+  attention_mask marks the padding so it's excluded from real attention.
+  (2) Different *finish times* during decode don't shrink the tensor at
+  all - the batch dimension stays fixed size for the whole generation
+  (that's the "fixed membership" in this step's name); a finished
+  sequence just stops being recorded while still occupying its row,
+  fed filler tokens, until Step 3 adds the ability to actually remove
+  it from the tensor.

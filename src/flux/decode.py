@@ -6,11 +6,12 @@ that's exactly what continuous batching needs to do between every single
 token. Hand-rolling the loop here is what makes stopping after any one
 step possible.
 
-Step 1 scope (see docs/continuous_batching_notes.md): ONE sequence, no
-batching (Step 2) and no admission/eviction mid-generation (Step 3). This
-file exists to prove the token-by-token mechanism is correct - identical
-output to model.generate() under greedy decoding - before anything gets
-built on top of it.
+See docs/continuous_batching_notes.md for the build order. generate_one()
+is Step 1 (one sequence). generate_batch_fixed() is Step 2 (several
+sequences, fixed membership for the whole generation - no admission or
+eviction mid-generation yet, that's Step 3). Both exist to prove each
+mechanism is correct - identical output to model.generate() under greedy
+decoding - before anything gets built on top of it.
 """
 
 from __future__ import annotations
@@ -84,3 +85,88 @@ def generate_one(
 
     text = tokenizer.decode(generated_ids, skip_special_tokens=True)
     return text, len(generated_ids)
+
+
+def generate_batch_fixed(
+    model,
+    tokenizer,
+    prompts: list[str],
+    max_new_tokens_list: list[int],
+    device: str,
+) -> list[tuple[str, int]]:
+    """Batched decode, fixed membership (Step 2): several sequences run the
+    token-by-token loop together, but no one joins or leaves mid-generation -
+    that's Step 3. The thing this has to get right is sequences finishing
+    (their own max_new_tokens, or EOS) at different steps: a finished
+    sequence keeps running through the shared forward pass (wasted but
+    harmless compute - each batch row's attention is isolated from every
+    other row), it just stops having its tokens recorded.
+
+    Returns (text, output_tokens) per prompt, same convention as the
+    single-sequence and static-batched paths.
+    """
+    tokenizer.padding_side = "left"
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True)
+    input_ids = inputs["input_ids"].to(device)
+    attention_mask = inputs["attention_mask"].to(device)
+    batch_size = input_ids.shape[0]
+    prompt_len = input_ids.shape[1]
+
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id
+    max_new = max(max_new_tokens_list)
+
+    generated: list[list[int]] = [[] for _ in range(batch_size)]
+    finished = [False] * batch_size
+
+    with torch.no_grad():
+        # Prefill: one forward pass over the whole (padded) batch of prompts.
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
+        past_key_values = outputs.past_key_values
+        next_token_ids = outputs.logits[:, -1, :].argmax(dim=-1)  # shape (batch_size,)
+
+        position = prompt_len
+
+        for _ in range(max_new):
+            # Decide, per sequence, whether this step's predicted token is
+            # real output or the sign that this sequence is done.
+            for i in range(batch_size):
+                if finished[i]:
+                    continue
+                token_id = next_token_ids[i].item()
+                if token_id == eos_id or len(generated[i]) >= max_new_tokens_list[i]:
+                    finished[i] = True
+                    continue
+                generated[i].append(token_id)
+
+            if all(finished):
+                break
+
+            # Finished rows get fed a filler token - it only affects that
+            # row's own (already-ignored) future, never anyone else's.
+            feed_ids = torch.tensor(
+                [[pad_id if finished[i] else next_token_ids[i].item()] for i in range(batch_size)],
+                device=device,
+            )
+            attention_mask = torch.cat(
+                [attention_mask, torch.ones((batch_size, 1), dtype=attention_mask.dtype, device=device)],
+                dim=1,
+            )
+            cache_position = torch.tensor([position], device=device)
+
+            outputs = model(
+                input_ids=feed_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            next_token_ids = outputs.logits[:, -1, :].argmax(dim=-1)
+            position += 1
+
+    results = []
+    for i in range(batch_size):
+        text = tokenizer.decode(generated[i], skip_special_tokens=True)
+        results.append((text, len(generated[i])))
+    return results
