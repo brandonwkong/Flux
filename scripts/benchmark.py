@@ -77,7 +77,7 @@ WARMUP_MAX_NEW_TOKENS = 8  # warmup (cudnn autotune, first-call JIT) doesn't pol
 # across policies isn't confounded by different random loads.
 REQUEST_MIX_SEED = 1234
 INTERACTIVE_SHARE = 0.3
-INTERACTIVE_PRIORITY, INTERACTIVE_DEADLINE_MS = 15, 800
+INTERACTIVE_PRIORITY, INTERACTIVE_DEADLINE_MS = 15, 1500  # measured floor at concurrency=1 is ~900-1100ms compute alone
 BATCH_PRIORITY, BATCH_DEADLINE_MS = 3, 8000
 
 
