@@ -356,14 +356,24 @@ def stop_server(process: subprocess.Popen) -> None:
         process.wait()
 
 
-def write_csv(rows: list[dict], path: Path) -> None:
-    if not rows:
-        print("No results to write.")
-        return
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+def init_csv(path: Path) -> None:
+    """Start this run's output file fresh - a stale file from a previous run
+    at the same path must not get silently appended to."""
+    if path.exists():
+        path.unlink()
+
+
+def append_csv_row(row: dict, path: Path) -> None:
+    """Append one completed cell's row immediately, writing the header first
+    if this is the first row. So that stopping or crashing the sweep midway
+    never loses the cells that already finished - each is durable as soon
+    as it completes, not held in memory until the very end."""
+    write_header = not path.exists()
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 async def sweep(
@@ -373,10 +383,16 @@ async def sweep(
     max_new_tokens: int,
     load_model: str,
     repeats: int,
+    concurrency_1_requests: int,
+    concurrency_1_repeats: int,
+    output_path: Path,
 ) -> list[dict]:
     """Run every (policy, concurrency) combination, restarting the server once
     per policy, repeating each combination `repeats` times and keeping the
-    median run."""
+    median run. concurrency=1 is a control point, not a load test - with
+    only one request ever in flight, the three scheduling policies are
+    behaviorally identical (nothing to ever schedule between), so it gets
+    its own much smaller request/repeat count rather than the full size."""
     run_fn = LOAD_MODELS[load_model]
     rows = []
     for policy in policies:
@@ -389,22 +405,28 @@ async def sweep(
             print("Warmup complete.")
 
             for concurrency in concurrencies:
-                print(f"  policy={policy} concurrency={concurrency} requests={num_requests} repeats={repeats}")
+                if concurrency == 1:
+                    cell_requests, cell_repeats = concurrency_1_requests, concurrency_1_repeats
+                else:
+                    cell_requests, cell_repeats = num_requests, repeats
+
+                print(f"  policy={policy} concurrency={concurrency} requests={cell_requests} repeats={cell_repeats}")
                 repeat_rows = []
-                for _ in range(repeats):
-                    result = await run_fn(policy, concurrency, num_requests, max_new_tokens)
+                for _ in range(cell_repeats):
+                    result = await run_fn(policy, concurrency, cell_requests, max_new_tokens)
                     repeat_rows.append(result.to_row())
 
                 row = _median_row(repeat_rows)
                 rows.append(row)
+                append_csv_row(row, output_path)
                 print(
-                    f"    [median of {repeats}] p50={row['latency_p50_ms']:.1f}ms  p99={row['latency_p99_ms']:.1f}ms  "
+                    f"    [median of {cell_repeats}] p50={row['latency_p50_ms']:.1f}ms  p99={row['latency_p99_ms']:.1f}ms  "
                     f"req/s={row['requests_per_sec']:.2f}  tok/s={row['tokens_per_sec']:.1f}  "
                     f"goodput={row['goodput_req_per_sec']:.2f}  avg_batch={row['avg_batch_size']:.1f}  "
                     f"deadline_met interactive={row['deadline_met_pct_interactive']:.1f}% "
                     f"batch={row['deadline_met_pct_batch']:.1f}%  "
                     f"queue_avg={row['queue_time_avg_ms']:.1f}ms  queue_p99={row['queue_time_p99_ms']:.1f}ms  "
-                    f"errors={row['error_count']}"
+                    f"errors={row['error_count']}  [saved]"
                 )
         finally:
             stop_server(process)
@@ -422,7 +444,19 @@ def main() -> None:
         "--requests", "-n", type=int, default=200, help="Requests per (policy, concurrency) combination"
     )
     parser.add_argument(
-        "--repeats", type=int, default=3, help="Repeats per combination; the median run is kept"
+        "--repeats", type=int, default=3, help="Repeats per combination (except concurrency=1); the median run is kept"
+    )
+    parser.add_argument(
+        "--concurrency-1-requests",
+        type=int,
+        default=50,
+        help="Requests for the concurrency=1 cell specifically - a control point, not a load test",
+    )
+    parser.add_argument(
+        "--concurrency-1-repeats",
+        type=int,
+        default=1,
+        help="Repeats for the concurrency=1 cell specifically",
     )
     parser.add_argument(
         "--load-model",
@@ -437,19 +471,30 @@ def main() -> None:
 
     policies = [p.strip() for p in args.policies.split(",")]
     concurrencies = [int(c.strip()) for c in args.concurrencies.split(",")]
+    output_path = Path(args.output)
 
     print(
         f"Sweeping {len(policies)} policies x {len(concurrencies)} concurrency levels "
-        f"({len(policies) * len(concurrencies)} cells, {args.repeats} repeats each, "
-        f"{args.requests} requests per repeat, load_model={args.load_model})"
+        f"({args.repeats} repeats each at {args.requests} requests, except concurrency=1: "
+        f"{args.concurrency_1_repeats} repeat(s) at {args.concurrency_1_requests} requests, "
+        f"load_model={args.load_model}) -> {output_path} (written incrementally, one row per cell)"
     )
 
+    init_csv(output_path)
     rows = asyncio.run(
-        sweep(policies, concurrencies, args.requests, args.max_new_tokens, args.load_model, args.repeats)
+        sweep(
+            policies,
+            concurrencies,
+            args.requests,
+            args.max_new_tokens,
+            args.load_model,
+            args.repeats,
+            args.concurrency_1_requests,
+            args.concurrency_1_repeats,
+            output_path,
+        )
     )
 
-    output_path = Path(args.output)
-    write_csv(rows, output_path)
     print(f"\nWrote {len(rows)} rows to {output_path}")
 
 
