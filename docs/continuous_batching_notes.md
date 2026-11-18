@@ -234,3 +234,64 @@ an 8-token request (B) joining 300ms in reported `batch_size=1` for A
 and `batch_size=2` for B. Checked the arithmetic by hand: A spent ~56
 of its 64 steps alone and ~8 shared with B, averaging to
 (56x1 + 8x2)/64 = 1.125, which rounds to 1 - matches exactly.
+
+## Post-Step-4 investigation: why was continuous batching slower in the final sweep?
+
+The static-vs-continuous comparison (both at the same trimmed config)
+showed continuous batching with *higher* `compute_time_ms` in most
+cells - 25-65% higher in the contested ones - which ate the queueing
+win. Before accepting "continuous batching lost" as the real answer,
+profiled where a decode step's time actually goes, in one session,
+rather than guessing.
+
+**Suspect list, each measured directly, each ruled out:**
+
+1. *Per-token GPU->CPU syncs* (`.item()` in the finish-check loop).
+   Patched to one bulk `.tolist()` transfer instead of N per-sequence
+   `.item()` calls. Result: 30.2ms/step before, 31.1ms/step after - no
+   measurable difference.
+2. *KV cache concat/slice on admission/eviction*. Measured pure decode
+   (no admit/evict happening) at 28.4ms/step vs the full loop with
+   admission folded in at 30.2ms/step - the cost is real but tiny and
+   one-time-per-request, not a recurring per-token tax.
+3. *The executor round-trip itself*. `step()` called directly: ~30ms.
+   Same call via `await loop.run_in_executor(...)`: 31.5ms. ~1.5ms of
+   genuine dispatch overhead, not enough to explain a 25-65% gap.
+
+**Two more checks, beyond the original list:**
+
+- `step()`'s cost is flat across batch size 1 through 8 (26.8-32.6ms
+  regardless), and flat across sequence length 36 through 136 tokens.
+  Neither scales the way "GPU compute" or "growing tensor copy" would
+  predict - this cost looks like fixed per-call overhead (Python
+  dispatch + CUDA kernel launch across 22 transformer layers), not
+  anything specific to this implementation.
+- Compared directly against `model.generate()`'s own internal per-token
+  cost on the identical batch: **32.16ms/token** - statistically
+  indistinguishable from the hand-rolled loop's ~27-32ms/step. The
+  hand-written decode loop is not inherently slower than HF's own
+  internal loop.
+
+**Then the real surprise**: re-ran the same single-request scenario
+through the actual `Engine` class directly (no HTTP) and got
+28-32ms/token - then through the full running server over real HTTP
+and got 28-40ms/token. Neither reproduced the original sweep's
+consistent 44-46ms/token at concurrency=1. Checked `nvidia-smi`: the
+same 4-5 background processes were present in both cases, but GPU
+memory usage was lower during this diagnostic session (153MB) than
+right after the original sweep finished (266MB) - weak but suggestive
+evidence that the gap is more consistent with **GPU contention varying
+over the ~45-minute sweep** than with anything fixable in this code.
+
+**Conclusion, stated plainly: no code-level fix is justified by this
+evidence.** All three originally-suspected mechanisms were measured
+and ruled out individually. The decode primitive itself costs the same
+whether hand-rolled or run through `generate()`. The most likely
+explanation for the benchmark gap is environmental (background GPU
+load fluctuating across a long run), which is a measurement problem,
+not an engineering one - the real fix is a cleaner GPU and/or
+back-to-back (not sequential) static/continuous runs to control for
+contention drift, not a change to `decode.py` or `engine.py`.
+
+Profiling script kept at `scripts/profile_decode_step.py` for anyone
+who wants to re-run this investigation under cleaner conditions.
