@@ -164,14 +164,14 @@ class TestContinuousBatchMatchesGenerateOne:
         # Admit A alone, step twice so it's mid-generation.
         batch.admit("A", *requests["A"])
         for _ in range(2):
-            for seq_id, text, output_tokens in batch.step():
+            for seq_id, text, output_tokens, _ in batch.step():
                 finished[seq_id] = (text, output_tokens)
 
         # Admit B while A is still running (tests padding the new, longer
         # prompt against an existing shorter batch and vice versa).
         batch.admit("B", *requests["B"])
         for _ in range(2):
-            for seq_id, text, output_tokens in batch.step():
+            for seq_id, text, output_tokens, _ in batch.step():
                 finished[seq_id] = (text, output_tokens)
 
         # Admit C while A and/or B may still be running.
@@ -179,7 +179,7 @@ class TestContinuousBatchMatchesGenerateOne:
 
         # Run until everyone still active has finished.
         while batch.active_count > 0:
-            for seq_id, text, output_tokens in batch.step():
+            for seq_id, text, output_tokens, _ in batch.step():
                 finished[seq_id] = (text, output_tokens)
 
         assert set(finished.keys()) == set(requests.keys())

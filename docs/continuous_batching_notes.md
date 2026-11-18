@@ -203,3 +203,34 @@ exact failure mode static batching had and continuous batching doesn't.
   (often zero, sometimes one, rarely several) - a much higher-frequency,
   lower-stakes decision. FIFO/priority/EDF didn't need to change at
   all; what changed is how often, and over how much, they get asked.
+
+## Step 4 - Timing semantics
+
+**Concept.** `queue_time_ms` and `compute_time_ms` already took on their
+new per-sequence meanings as a direct consequence of Step 3's design
+(arrival->admission, admission->finish) - nothing left to decide there.
+The one open question was `batch_size`: under static batching it was
+trivially well-defined (the whole batch was fixed for the entire
+request), but continuous batching has no single "the batch" a request
+belongs to - it can share steps with a different, changing set of
+sequences throughout its life.
+
+**The decision.** Three options were on the table: a snapshot at
+admission time, a lifetime peak, or a lifetime average. Chose the
+**average active-sequence count across every step the request's
+generation participated in** - the number that answers "how batched was
+this request's compute, overall," which is the closest continuation of
+what the field always meant.
+
+**What was built.** `ContinuousBatch` now accumulates, per active
+sequence, a running sum of `len(active)` sampled at the top of every
+`step()` call, plus a sample count; on finish, `avg_active_count =
+sum / samples`. `engine.py` rounds this to an int for the
+`GenerateResponse.batch_size` field - same field name, same type, so
+the benchmark script needs no changes.
+
+**Verified on the live server**, warm: a 64-token request (A) run with
+an 8-token request (B) joining 300ms in reported `batch_size=1` for A
+and `batch_size=2` for B. Checked the arithmetic by hand: A spent ~56
+of its 64 steps alone and ~8 shared with B, averaging to
+(56x1 + 8x2)/64 = 1.125, which rounds to 1 - matches exactly.

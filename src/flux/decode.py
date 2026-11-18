@@ -228,6 +228,8 @@ class _ActiveSeq:
     max_new_tokens: int
     position: int
     generated: list[int] = field(default_factory=list)
+    active_count_sum: int = 0
+    active_count_samples: int = 0
 
 
 class ContinuousBatch:
@@ -306,20 +308,31 @@ class ContinuousBatch:
         self._next_token_ids = torch.cat([self._next_token_ids, new_next_token_id], dim=0)
         self._active.append(new_seq)
 
-    def step(self) -> list[tuple[Any, str, int]]:
+    def step(self) -> list[tuple[Any, str, int, float]]:
         """One iteration: evaluate every active sequence's last-predicted
         token (from admission's prefill, or the previous step's decode),
         evict whoever just finished, then run one decode step for whoever
-        is left. Returns (seq_id, text, output_tokens) for each sequence
-        that finished this step."""
-        finished_results: list[tuple[Any, str, int]] = []
+        is left. Returns (seq_id, text, output_tokens, avg_active_count)
+        for each sequence that finished this step - avg_active_count is
+        how many sequences were active, on average, across every step
+        this one shared the batch with."""
+        # Sample how crowded the batch was this step, for everyone in it -
+        # including whoever's about to be evaluated as finished below,
+        # since they were genuinely part of this step too.
+        current_size = len(self._active)
+        for seq in self._active:
+            seq.active_count_sum += current_size
+            seq.active_count_samples += 1
+
+        finished_results: list[tuple[Any, str, int, float]] = []
         keep_indices: list[int] = []
 
         for i, seq in enumerate(self._active):
             token_id = self._next_token_ids[i].item()
             if token_id == self.eos_id or len(seq.generated) >= seq.max_new_tokens:
                 text = self.tokenizer.decode(seq.generated, skip_special_tokens=True)
-                finished_results.append((seq.seq_id, text, len(seq.generated)))
+                avg_active_count = seq.active_count_sum / seq.active_count_samples
+                finished_results.append((seq.seq_id, text, len(seq.generated), avg_active_count))
             else:
                 seq.generated.append(token_id)
                 keep_indices.append(i)

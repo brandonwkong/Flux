@@ -54,7 +54,6 @@ class Engine:
         # directly as ContinuousBatch's seq_id too - one id, one meaning).
         self._requests_by_id: dict[str, QueuedRequest] = {}
         self._admitted_at: dict[str, float] = {}
-        self._batch_size_at_admission: dict[str, int] = {}
 
     async def start(self) -> None:
         """Load the model (blocking, so it runs off the event loop thread) and start the loop."""
@@ -149,9 +148,8 @@ class Engine:
 
             self._requests_by_id[request.id] = request
             self._admitted_at[request.id] = admitted_at
-            self._batch_size_at_admission[request.id] = self._batch.active_count
 
-    def _resolve_finished(self, finished: list[tuple[str, str, int]]) -> None:
+    def _resolve_finished(self, finished: list[tuple[str, str, int, float]]) -> None:
         """Resolve each just-finished sequence's Future the moment it finishes.
 
         queue_time_ms: arrival into the queue -> admission into the active
@@ -160,15 +158,17 @@ class Engine:
         because there's no longer a "whole batch" that starts and ends
         together.
 
-        batch_size: a provisional choice for Step 3, flagged as such -
-        the number of active sequences at the moment THIS request was
-        admitted. Step 4 revisits what this field should mean now.
+        batch_size: average number of active sequences across every step
+        this request's generation shared the batch with (Step 4's choice,
+        over a snapshot-at-admission or peak alternative) - this is the
+        number that answers "how batched was this request's compute,
+        overall," which is what the field always meant back when the
+        batch was fixed for the whole request.
         """
         now = time.perf_counter()
-        for seq_id, text, output_tokens in finished:
+        for seq_id, text, output_tokens, avg_batch_size in finished:
             request = self._requests_by_id.pop(seq_id, None)
             admitted_at = self._admitted_at.pop(seq_id, None)
-            batch_size = self._batch_size_at_admission.pop(seq_id, 1)
             if request is None or admitted_at is None:
                 continue
 
@@ -178,7 +178,7 @@ class Engine:
                         text=text,
                         queue_time_ms=(admitted_at - request.arrived_at) * 1000,
                         compute_time_ms=(now - admitted_at) * 1000,
-                        batch_size=batch_size,
+                        batch_size=round(avg_batch_size),
                         output_tokens=output_tokens,
                     )
                 )
