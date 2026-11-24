@@ -4,42 +4,58 @@ A single-process LLM inference runtime, built to learn inference-runtime enginee
 batching, scheduling, KV cache — and eventually kernel-level optimization. Not a
 platform: one process, one model (TinyLlama-1.1B), one GPU.
 
+The engine runs **continuous (iteration-level) batching**: between every single decode
+step it admits newly-arrived requests and evicts anyone who just finished, resolving
+each one's Future immediately — not at the end of some larger, shared `generate()` call
+everyone had to wait for. An earlier static-batching version (whole batches run to
+completion together) was replaced after being benchmarked against it head-to-head; see
+[Benchmarking](#benchmarking) for the real numbers and the (workload-dependent) verdict.
+
 ## Architecture
 
 ```
 POST /generate
       │
       ▼
-┌─────────────────────────────────────────────────────────────┐
-│                            FLUX                              │
-│                                                               │
-│   RequestQueue                Engine                         │
-│   ┌──────────────┐    pick    ┌──────────────────────────┐   │
-│   │ req ─ Future  │◄──next────│ scheduler.select_batch()  │   │
-│   │ req ─ Future  │   batch   │  FIFO / PRIORITY / EDF    │   │
-│   │ req ─ Future  │           │           │               │   │
-│   └──────────────┘           │           ▼               │   │
-│                               │   one padded forward pass │   │
-│                               │   through TinyLlama (GPU) │   │
-│                               └──────────────┬─────────────┘   │
-│                                              │                 │
-│                               resolves each Future with        │
-│                               text + queue_time_ms +            │
-│                               compute_time_ms + batch_size      │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                              FLUX                                 │
+│                                                                    │
+│   RequestQueue                      Engine (_run_loop, every step) │
+│   ┌──────────────┐    admit up to  ┌───────────────────────────┐   │
+│   │ req ─ Future  │◄──free slots───│ scheduler.select_batch()  │   │
+│   │ req ─ Future  │   (scheduler   │  FIFO / PRIORITY / EDF     │   │
+│   │ req ─ Future  │    order)      │           │                │   │
+│   └──────────────┘                 │           ▼                │   │
+│                                     │   ContinuousBatch.step():  │   │
+│                                     │   one decode step across   │   │
+│                                     │   all active sequences,    │   │
+│                                     │   finished ones evicted    │   │
+│                                     └──────────────┬─────────────┘   │
+│                                                     │                 │
+│                                      resolves each finished Future    │
+│                                      with text + per-sequence          │
+│                                      queue_time_ms + compute_time_ms + │
+│                                      avg batch_size it ran alongside   │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 Two concerns kept deliberately separate:
 
 - **Scheduling** (`scheduler.py`) decides *which* pending requests get pulled into the
-  next batch, given more are waiting than fit. Swappable at process start: FIFO, PRIORITY
-  (highest priority first, FIFO tie-break), EDF (earliest absolute deadline first).
-- **Batching** (`engine.py`) decides *how many* requests run together in one GPU forward
-  pass, and lives inside the engine's own loop — not a separate pre-worker stage.
+  active set next, given more are waiting than fit. Swappable at process start: FIFO,
+  PRIORITY (highest priority first, FIFO tie-break), EDF (earliest absolute deadline
+  first). Unchanged by the continuous-batching migration — the same `select_batch()` now
+  just gets called every decode step instead of once per whole batch.
+- **Batching** (`decode.py`'s `ContinuousBatch`, driven by `engine.py`'s loop) decides
+  *how many and which* sequences share one GPU forward pass, and that membership can
+  change every step — a request admitted mid-step joins the very next decode step; a
+  request that finishes is evicted and its Future resolved immediately, without waiting
+  for anyone else still generating.
 
 Each request gets an `asyncio.Future` the instant it's enqueued (`queue.py`); the HTTP
-handler just awaits it. Whether the engine ran that request alone, first, last, or
-batched with five others is invisible to the caller.
+handler just awaits it. Whether the engine ran that request alone, admitted it mid-step
+next to five others already decoding, or evicted it early because it hit its own
+`max_new_tokens` while its neighbors kept going, is invisible to the caller.
 
 ## Quick Start
 
@@ -71,18 +87,18 @@ Use `127.0.0.1`, not `localhost` — on Windows, httpx tries IPv6 (`::1`) first 
 `GenerateRequest`: `prompt`, `max_new_tokens`, `priority` (read by the PRIORITY policy),
 `deadline_ms` (read by the EDF policy).
 
-`GenerateResponse`: `text`, `queue_time_ms` (time spent waiting before this request's
-batch started), `compute_time_ms` (wall-clock time of the shared forward pass — the same
-value for every request in that batch, since that's literally how much GPU time they
-shared), `batch_size`.
+`GenerateResponse`: `text`, `queue_time_ms` (time from arrival to admission into the
+active batch), `compute_time_ms` (admission to finish — genuinely per-request now, since
+continuous batching has no single "batch" that starts and ends together), `batch_size`
+(the average number of active sequences this request's generation ran alongside, across
+every decode step it was part of).
 
 ## Configuration
 
 | Environment Variable | Default | Description |
 |---|---|---|
 | `FLUX_MODEL` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | HF model id |
-| `MAX_BATCH_SIZE` | 8 | Max requests per forward pass |
-| `MAX_WAIT_MS` | 20 | How long the engine waits for stragglers to join a forming batch |
+| `MAX_BATCH_SIZE` | 8 | Max concurrently-active sequences in the continuous batch |
 | `MAX_QUEUE_DEPTH` | 1000 | Backpressure threshold (503 past this) |
 | `SCHEDULING_POLICY` | `fifo` | `fifo` \| `priority` \| `edf` — **read once at startup** |
 
@@ -92,23 +108,84 @@ Changing `SCHEDULING_POLICY` means restarting the process, same as changing the 
 
 `scripts/benchmark.py` is a first-class part of this project, not an afterthought: it
 answers "how does each scheduling policy actually behave under concurrent load,"
-honestly, against the real model.
-
-```bash
-# Default sweep: 3 policies x 5 concurrency levels, one command.
-python scripts/benchmark.py --output results.csv
-```
-
-Since the policy is fixed at startup, the script manages the server itself — restarting
-it once per policy (reusing that one process across all of that policy's concurrency
-levels) and writing one row per (policy, concurrency) combination: latency percentiles,
-throughput, and the average queue-time/compute-time split pulled straight from every
+honestly, against the real model. It models virtual users issuing requests under a
+traffic mix of two classes — **interactive** (short, tight deadline, high priority) and
+**batch** (long, loose deadline, low priority) — and tracks per-class latency, deadline
+compliance, throughput, and the queue-time/compute-time split pulled straight from every
 response body.
 
-Measured on an RTX 4070 Laptop GPU, TinyLlama-1.1B, 16 new tokens, after warmup: a single
-request's shared forward pass takes ~500ms; six concurrent requests land in one batch and
-share a ~765ms forward pass — ~4x the throughput of running them one at a time. That's
-the whole point of batching, with real numbers instead of simulated ones.
+```bash
+# Default sweep: 3 policies x 5 concurrency levels, uniform-length workload.
+python scripts/benchmark.py --output results.csv
+
+# Mixed-length workload: interactive requests (32 tokens) and batch requests
+# (256 tokens, same traffic mix otherwise) — see below for why this exists.
+python scripts/benchmark.py --workload mixed --output results.csv
+```
+
+### Static vs. continuous batching: a controlled, workload-dependent result
+
+Flux originally used static (request-level) batching — a whole `generate()` call ran to
+completion for every sequence in a batch before the engine could form the next one. It
+was replaced with continuous (iteration-level) batching (see Architecture above). Rather
+than assume continuous batching is strictly better — it's the harder design to get right,
+and real systems adopt it for a reason — both engines were benchmarked head-to-head under
+identical conditions: same GPU, same model, alternating start order, rotated policy order
+across repeats, GPU state logged throughout each run to rule out thermal/power
+contamination (`scripts/controlled_comparison.py`, `scripts/mixed_comparison.py`).
+
+**Uniform-length workload** (`controlled_sweep.csv` — every request asks for the same 32
+tokens, so there's nothing for fine-grained admission to rescue): static batching won on
+raw throughput and latency at both concurrency levels tested.
+
+| Concurrency | Engine | req/s (avg) | latency p50 (avg, ms) |
+|---|---|---|---|
+| 8 | static | 6.56 | ~1,090 |
+| 8 | continuous | 5.89 | ~1,155 |
+| 16 | static | 7.59 | ~2,093 |
+| 16 | continuous | 5.82 | ~2,711 |
+
+At concurrency 16, continuous batching had ~23% lower throughput and ~30% higher median
+latency than static — the per-step overhead of continuous batching (admitting/evicting
+every decode step, concatenating and slicing the KV cache to change membership) has
+nothing to buy back when every request is the same length. This result held up under a
+GPU diagnostic (clocks, power, temperature, throttle flags) run before launching, and
+across 3 repeats with rotated ordering — it isn't noise.
+
+**Mixed-length workload** (`mixed_sweep.csv` — interactive requests ask for 32 tokens,
+batch requests ask for 192-256; the traffic mix otherwise matches): continuous batching
+won decisively on the metric that's the actual point of having two traffic classes —
+interactive requests meeting their deadline instead of queuing behind a long batch
+request.
+
+| Concurrency | Engine | interactive deadline-met % (avg across policies/repeats) |
+|---|---|---|
+| 8 | static | **0%** (every single run) |
+| 8 | continuous | **~62%** |
+| 16 | static | **0%** (every single run) |
+| 16 | continuous | **~15%** |
+
+Under static batching, an interactive request arriving mid-batch has no way to avoid
+waiting for every long batch request already running in that batch to finish — it missed
+its deadline in all 18 runs at both concurrency levels, with no exceptions. Continuous
+batching lets a short request get admitted (and finish) between decode steps, without
+waiting for anyone else's generation to complete — the exact mechanism static batching
+lacks. Compliance drops as concurrency rises (62% → 15%) because admission itself becomes
+the bottleneck once `MAX_BATCH_SIZE` active slots are saturated — a request still has to
+wait for a slot to free up, continuous batching just frees slots far more often than
+static does.
+
+**The honest overall conclusion is workload-dependent, not a blanket "continuous is
+better":** continuous batching loses on a uniform-length workload (pure per-step overhead,
+nothing to rescue) and wins decisively on a mixed-length workload (admission-time rescue
+is the whole point of the design) — which is also the realistic case for an interactive
+API serving a mix of request shapes. `scripts/profile_decode_step.py` investigated the
+uniform-workload overhead directly (per-token GPU syncs, KV cache concat/slice copies,
+the executor round-trip) and found none of the three suspects individually explained the
+gap under isolated profiling — it's left as an open question, not a code-level fix, since
+the evidence didn't point at one specific line to change.
+
+Measured on an RTX 4070 Laptop GPU, TinyLlama-1.1B throughout.
 
 ## Project Structure
 
@@ -118,13 +195,21 @@ flux/
 │   ├── schemas.py     # GenerateRequest/GenerateResponse - the wire format
 │   ├── queue.py        # RequestQueue: async pool, each request carries a Future
 │   ├── scheduler.py    # select_batch(): FIFO / PRIORITY / EDF, swappable
-│   ├── engine.py        # Loads TinyLlama, owns the batch loop, times queue vs compute
+│   ├── decode.py        # ContinuousBatch: admit()/step(), per-sequence KV cache + position tracking
+│   ├── engine.py        # Loads TinyLlama, owns the continuous batch loop, times queue vs compute
 │   └── server.py        # FastAPI app: POST /generate, GET /health, GET /stats
 ├── scripts/
-│   └── benchmark.py     # Policy x concurrency sweep -> CSV
+│   ├── benchmark.py             # Policy x concurrency sweep -> CSV; --workload uniform|mixed
+│   ├── controlled_comparison.py # Static-vs-continuous, uniform workload (git worktree + PYTHONPATH switch)
+│   ├── mixed_comparison.py      # Static-vs-continuous, mixed workload, continuous GPU logging
+│   └── profile_decode_step.py   # torch.profiler breakdown of one continuous decode step
 ├── tests/
 │   ├── test_queue.py
-│   └── test_scheduler.py
+│   ├── test_scheduler.py
+│   └── test_decode.py
+├── baseline_sweep.csv, continuous_sweep.csv   # Single-engine sweeps
+├── controlled_sweep.csv, mixed_sweep.csv       # Static-vs-continuous results (see Benchmarking)
+├── mixed_sweep_gpu_log.csv                     # Continuous 5s GPU samples, tagged per cell
 └── pyproject.toml
 ```
 
@@ -133,18 +218,21 @@ flux/
 Real gaps in the current design, worth knowing before quoting a number or planning the
 next piece of work:
 
-- **Request-level batching, not continuous batching.** A batch runs to completion (every
-  sequence finishes its `generate()` call) before the engine can form the next one — a
-  request that arrives mid-batch waits for the whole batch to finish, even if its own
-  generation would be short. Real systems (vLLM, TensorRT-LLM) let new requests join and
-  finished ones leave every decode step. That's the natural next target once KV cache
-  management is in place.
-- **Shared `max_new_tokens` per batch.** One `generate()` call uses the largest
-  `max_new_tokens` asked for in the batch; a request asking for fewer tokens still waits
-  for the longest one in its batch, then gets truncated down to what it asked for.
-- **No KV cache reuse across requests or batches.** Each `generate()` call manages its
-  own ephemeral KV cache internally; there's no prefix sharing, paging, or cache-aware
-  scheduling yet. That's the KV-cache half of this project's learning goal, still ahead.
+- **Continuous batching's per-step overhead loses on uniform-length workloads.** See
+  Benchmarking above — at concurrency 16, continuous batching is ~23% lower throughput
+  and ~30% higher median latency than the static engine it replaced, when every request
+  is the same length. The cause wasn't pinned to one specific line (profiling ruled out
+  three named suspects without a conclusive winner); it's an open question, not yet a
+  fixed one.
+- **Admission becomes the bottleneck at high concurrency, even for continuous batching.**
+  Interactive deadline compliance under the mixed workload drops from ~62% at
+  concurrency 8 to ~15% at concurrency 16 — once `MAX_BATCH_SIZE` active slots are
+  saturated, a short request still waits for a slot, regardless of how fast slots turn
+  over once it's in.
+- **No KV cache reuse across requests.** Each sequence's cache is independent; there's no
+  prefix sharing or paging across different requests, just the single concatenated cache
+  across the active batch. That's the KV-cache-as-constraint half of this project's
+  learning goal, still ahead.
 - **Single GPU, single model, single process — by design.** This is deliberately not a
   platform. Docker/Prometheus/Grafana were cut from the core path; they can come back as
   optional extras once the runtime itself has real numbers to show.
@@ -153,15 +241,15 @@ next piece of work:
 
 The two end artifacts this project is building toward:
 
-1. An LLM inference runtime benchmarked honestly under concurrent load (the sweep above,
-   with real percentiles and a real queue/compute split - not simulated numbers).
+1. An LLM inference runtime benchmarked honestly under concurrent load — done: a
+   continuous-batching engine, a scheduler-policy sweep, and a controlled static-vs-
+   continuous comparison across two workload shapes, all with real percentiles and a
+   real queue/compute split (see Benchmarking above).
 2. One custom profiled CUDA kernel with before-and-after numbers and a roofline
-   explanation for *why* it helped.
+   explanation for *why* it helped — not yet started.
 
 Roughly in order from here:
 
-- **Continuous batching** - let requests join/leave a forming batch every decode step,
-  not just between whole-batch `generate()` calls.
 - **KV-cache-aware scheduling** - track per-request KV cache memory as the real
   batching constraint (token budget, not request count), and route/prioritize
   accordingly.
