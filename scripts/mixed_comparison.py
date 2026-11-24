@@ -111,6 +111,8 @@ async def run_one_cell(
     workload load test, tear down. Returns the result row with engine
     name and a GPU-behavior summary folded in; full per-sample GPU log
     goes to gpu_log_path."""
+    cc.ensure_port_free(engine, policy)
+
     process = cc.start_server(engine, policy)
     gpu_rows: list[dict] = []
     stop_event = asyncio.Event()
@@ -119,6 +121,7 @@ async def run_one_cell(
 
     try:
         benchmark.wait_for_server()
+        cc.verify_server_policy(policy)
         await benchmark.warmup()
         result = await benchmark.run_virtual(
             policy, concurrency, num_requests, MAX_NEW_TOKENS_BASE, "mixed", mixed_batch_max_new_tokens

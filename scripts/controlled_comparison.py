@@ -98,6 +98,56 @@ def start_server(engine: str, policy: str) -> subprocess.Popen:
     return subprocess.Popen([sys.executable, "-m", "flux.server"], env=env, cwd=str(REPO_ROOT))
 
 
+def port_8000_occupant_pid() -> str | None:
+    """Returns the PID holding a LISTENING socket on port 8000, or None if
+    free. Exists because of a real bug caught while building the mixed-
+    workload comparison: a crashed earlier run left a server process
+    alive, and wait_for_server() kept "succeeding" against that stale
+    process for every subsequent cell - silently mislabeling every row
+    with the wrong engine/policy. This is the pre-flight half of the fix;
+    verify_server_policy below is the post-start half."""
+    try:
+        out = subprocess.check_output(["netstat", "-ano"], text=True, timeout=5)
+    except Exception:
+        return None
+    for line in out.splitlines():
+        if "LISTENING" in line and ":8000 " in line.replace("\t", " "):
+            parts = line.split()
+            if parts:
+                return parts[-1]
+    return None
+
+
+def ensure_port_free(engine: str, policy: str) -> None:
+    """Raise loudly, before starting anything, if port 8000 is already
+    occupied - rather than silently proceeding and talking to whatever's
+    already there."""
+    occupant = port_8000_occupant_pid()
+    if occupant is not None:
+        raise RuntimeError(
+            f"Port 8000 is already held by PID {occupant} before we even tried to start "
+            f"engine={engine} policy={policy} - a leaked server from an earlier run. "
+            f"Refusing to proceed (would silently talk to the wrong server). Kill PID "
+            f"{occupant} and re-run."
+        )
+
+
+def verify_server_policy(expected_policy: str) -> None:
+    """After wait_for_server() succeeds, confirm /stats reports the policy
+    we actually asked for - catches a stale server from a prior cell
+    answering in place of the one we think we just started."""
+    with httpx.Client() as client:
+        response = client.get(f"{benchmark.SERVER_URL}/stats", timeout=5.0)
+    actual_policy = response.json().get("policy")
+    if actual_policy != expected_policy:
+        raise RuntimeError(
+            f"Server integrity check failed: expected policy={expected_policy!r} but "
+            f"/stats reports policy={actual_policy!r}. This almost certainly means a "
+            f"stale server from an earlier run is still listening on port 8000 - "
+            f"stopping rather than silently recording mismatched data."
+        )
+
+
 def rotate(items: list[str], n: int) -> list[str]:
     n = n % len(items)
     return items[n:] + items[:n]
@@ -120,10 +170,12 @@ def append_csv_row(row: dict, path: Path) -> None:
 async def run_one_cell(engine: str, policy: str, concurrency: int, num_requests: int) -> dict:
     """Boot one server, warm it up, run the load test, tear it down.
     Returns the result row with engine name and GPU state before/after folded in."""
+    ensure_port_free(engine, policy)
     gpu_before = gpu_snapshot()
     process = start_server(engine, policy)
     try:
         benchmark.wait_for_server()
+        verify_server_policy(policy)
         await benchmark.warmup()
         result = await benchmark.run_virtual(policy, concurrency, num_requests, MAX_NEW_TOKENS)
     finally:
