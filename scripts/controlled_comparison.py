@@ -118,18 +118,32 @@ def port_8000_occupant_pid() -> str | None:
     return None
 
 
-def ensure_port_free(engine: str, policy: str) -> None:
-    """Raise loudly, before starting anything, if port 8000 is already
-    occupied - rather than silently proceeding and talking to whatever's
-    already there."""
-    occupant = port_8000_occupant_pid()
-    if occupant is not None:
-        raise RuntimeError(
-            f"Port 8000 is already held by PID {occupant} before we even tried to start "
-            f"engine={engine} policy={policy} - a leaked server from an earlier run. "
-            f"Refusing to proceed (would silently talk to the wrong server). Kill PID "
-            f"{occupant} and re-run."
-        )
+def ensure_port_free(engine: str, policy: str, retries: int = 5, retry_delay_s: float = 1.0) -> None:
+    """Raise loudly, before starting anything, if port 8000 is still
+    occupied after a short grace period - rather than silently proceeding
+    and talking to whatever's already there.
+
+    The grace period exists because of a real false alarm caught while
+    building this: the previous cell's stop_server() had already returned
+    (process.wait() confirmed the process exited), but Windows hadn't
+    fully released the LISTENING socket for a brief moment afterward -
+    this isn't a stuck process, just normal OS teardown lag. A genuinely
+    leaked process (the original bug this function exists for) stays
+    occupied across the whole retry window; a normal one clears within
+    the first second or two."""
+    occupant = None
+    for attempt in range(retries):
+        occupant = port_8000_occupant_pid()
+        if occupant is None:
+            return
+        time.sleep(retry_delay_s)
+
+    raise RuntimeError(
+        f"Port 8000 is still held by PID {occupant} after {retries * retry_delay_s:.0f}s of waiting, "
+        f"before we even tried to start engine={engine} policy={policy} - a leaked server from an "
+        f"earlier run. Refusing to proceed (would silently talk to the wrong server). Kill PID "
+        f"{occupant} and re-run."
+    )
 
 
 def verify_server_policy(expected_policy: str) -> None:
