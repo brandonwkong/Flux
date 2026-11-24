@@ -80,30 +80,50 @@ INTERACTIVE_SHARE = 0.3
 INTERACTIVE_PRIORITY, INTERACTIVE_DEADLINE_MS = 15, 1500  # measured floor at concurrency=1 is ~900-1100ms compute alone
 BATCH_PRIORITY, BATCH_DEADLINE_MS = 3, 8000
 
+# Mixed workload (--workload mixed): interactive keeps the uniform workload's
+# token count; batch gets a much longer generation, so there's actually a
+# long request for a short one to get trapped behind under static batching -
+# the uniform workload (every request exactly the same length) gives
+# continuous batching nothing to rescue. The uniform workload's behavior is
+# completely unaffected by any of this - see max_new_tokens_override below.
+MIXED_INTERACTIVE_MAX_NEW_TOKENS = 32
+MIXED_BATCH_MAX_NEW_TOKENS = 256  # trim target if ETA is too long: 256 -> 192
 
-def _make_request(rng: random.Random, i: int) -> tuple[str, int, int, str]:
-    """Return (prompt, priority, deadline_ms, traffic_class) for request i from the fixed two-class mix."""
+
+def _make_request(rng: random.Random, i: int, workload: str, mixed_batch_max_new_tokens: int) -> tuple:
+    """Return (prompt, priority, deadline_ms, traffic_class, max_new_tokens_override).
+
+    max_new_tokens_override is None for the uniform workload - callers fall
+    back to their own shared max_new_tokens argument, so that path's
+    behavior is byte-for-byte what it always was. For the mixed workload
+    it's the per-class token count (interactive stays short, batch goes
+    long), which is the entire point of this workload variant.
+    """
     if rng.random() < INTERACTIVE_SHARE:
+        override = MIXED_INTERACTIVE_MAX_NEW_TOKENS if workload == "mixed" else None
         return (
             f"Interactive {i}: answer in one short sentence - what color is the sky?",
             INTERACTIVE_PRIORITY,
             INTERACTIVE_DEADLINE_MS,
             "interactive",
+            override,
         )
+    override = mixed_batch_max_new_tokens if workload == "mixed" else None
     return (
         f"Batch {i}: tell me something interesting about space.",
         BATCH_PRIORITY,
         BATCH_DEADLINE_MS,
         "batch",
+        override,
     )
 
 
-def _request_stream(num_requests: int) -> list[tuple[str, int, int, str]]:
+def _request_stream(num_requests: int, workload: str = "uniform", mixed_batch_max_new_tokens: int = MIXED_BATCH_MAX_NEW_TOKENS) -> list[tuple]:
     """The fixed-seed request sequence for one run - identical across every
     policy, concurrency level, and repeat, so comparisons aren't confounded
     by different random loads."""
     rng = random.Random(REQUEST_MIX_SEED)
-    return [_make_request(rng, i) for i in range(num_requests)]
+    return [_make_request(rng, i, workload, mixed_batch_max_new_tokens) for i in range(num_requests)]
 
 
 @dataclass
@@ -122,6 +142,8 @@ class RunResult:
     batch_hits: int = 0
     total_time_s: float = 0.0
     latencies_ms: list[float] = field(default_factory=list)
+    interactive_latencies_ms: list[float] = field(default_factory=list)
+    batch_latencies_ms: list[float] = field(default_factory=list)
     queue_times_ms: list[float] = field(default_factory=list)
     compute_times_ms: list[float] = field(default_factory=list)
     batch_sizes: list[int] = field(default_factory=list)
@@ -148,6 +170,10 @@ class RunResult:
 
         self.success_count += 1
         self.latencies_ms.append(elapsed_ms)
+        if traffic_class == "interactive":
+            self.interactive_latencies_ms.append(elapsed_ms)
+        else:
+            self.batch_latencies_ms.append(elapsed_ms)
         self.queue_times_ms.append(payload["queue_time_ms"])
         self.compute_times_ms.append(payload["compute_time_ms"])
         self.batch_sizes.append(payload["batch_size"])
@@ -189,6 +215,14 @@ class RunResult:
             "latency_p95_ms": self._percentile(self.latencies_ms, 95),
             "latency_p99_ms": self._percentile(self.latencies_ms, 99),
             "latency_avg_ms": statistics.mean(self.latencies_ms) if self.latencies_ms else 0.0,
+            "interactive_latency_p50_ms": self._percentile(self.interactive_latencies_ms, 50),
+            "interactive_latency_avg_ms": (
+                statistics.mean(self.interactive_latencies_ms) if self.interactive_latencies_ms else 0.0
+            ),
+            "batch_latency_p50_ms": self._percentile(self.batch_latencies_ms, 50),
+            "batch_latency_avg_ms": (
+                statistics.mean(self.batch_latencies_ms) if self.batch_latencies_ms else 0.0
+            ),
             "queue_time_avg_ms": statistics.mean(self.queue_times_ms) if self.queue_times_ms else 0.0,
             "queue_time_p50_ms": self._percentile(self.queue_times_ms, 50),
             "queue_time_p95_ms": self._percentile(self.queue_times_ms, 95),
@@ -239,17 +273,23 @@ async def run_virtual(
     concurrency: int,
     num_requests: int,
     max_new_tokens: int,
+    workload: str = "uniform",
+    mixed_batch_max_new_tokens: int = MIXED_BATCH_MAX_NEW_TOKENS,
 ) -> RunResult:
     """Virtual-user load: `concurrency` workers, each looping
     send -> await response -> send next, pulling from the same fixed-seed
     stream until num_requests total have completed. No artificial queue
     beyond genuine concurrency - a worker's next send only happens once
-    its previous response actually arrived."""
+    its previous response actually arrived.
+
+    workload="uniform" (default) is exactly the original behavior: every
+    request gets the same max_new_tokens. workload="mixed" gives each
+    request its own max_new_tokens per traffic class (see _make_request)."""
     result = RunResult(policy=policy, concurrency=concurrency, num_requests=num_requests)
-    request_stream = _request_stream(num_requests)
+    request_stream = _request_stream(num_requests, workload, mixed_batch_max_new_tokens)
     next_index = 0
 
-    def _next_params() -> Optional[tuple[str, int, int, str]]:
+    def _next_params() -> Optional[tuple]:
         nonlocal next_index
         if next_index >= len(request_stream):
             return None
@@ -262,9 +302,12 @@ async def run_virtual(
             params = _next_params()
             if params is None:
                 return
-            prompt, priority, deadline_ms, traffic_class = params
+            prompt, priority, deadline_ms, traffic_class, max_new_tokens_override = params
+            effective_max_new_tokens = (
+                max_new_tokens_override if max_new_tokens_override is not None else max_new_tokens
+            )
             start = time.perf_counter()
-            payload = await _one_request(client, prompt, max_new_tokens, priority, deadline_ms)
+            payload = await _one_request(client, prompt, effective_max_new_tokens, priority, deadline_ms)
             elapsed_ms = (time.perf_counter() - start) * 1000
             result.record(elapsed_ms, payload, deadline_ms, traffic_class)
 
@@ -282,6 +325,8 @@ async def run_burst(
     concurrency: int,
     num_requests: int,
     max_new_tokens: int,
+    workload: str = "uniform",
+    mixed_batch_max_new_tokens: int = MIXED_BATCH_MAX_NEW_TOKENS,
 ) -> RunResult:
     """Burst load (legacy default): all num_requests created at once, gated
     through a semaphore of size `concurrency`. At low concurrency, most
@@ -291,13 +336,16 @@ async def run_burst(
     numbers at the same "concurrency" value. Kept for comparison."""
     result = RunResult(policy=policy, concurrency=concurrency, num_requests=num_requests)
     semaphore = asyncio.Semaphore(concurrency)
-    request_stream = _request_stream(num_requests)
+    request_stream = _request_stream(num_requests, workload, mixed_batch_max_new_tokens)
 
     async def bounded(client: httpx.AsyncClient, i: int) -> None:
-        prompt, priority, deadline_ms, traffic_class = request_stream[i]
+        prompt, priority, deadline_ms, traffic_class, max_new_tokens_override = request_stream[i]
+        effective_max_new_tokens = (
+            max_new_tokens_override if max_new_tokens_override is not None else max_new_tokens
+        )
         start = time.perf_counter()
         async with semaphore:
-            payload = await _one_request(client, prompt, max_new_tokens, priority, deadline_ms)
+            payload = await _one_request(client, prompt, effective_max_new_tokens, priority, deadline_ms)
         elapsed_ms = (time.perf_counter() - start) * 1000
         result.record(elapsed_ms, payload, deadline_ms, traffic_class)
 
@@ -386,6 +434,8 @@ async def sweep(
     concurrency_1_requests: int,
     concurrency_1_repeats: int,
     output_path: Path,
+    workload: str = "uniform",
+    mixed_batch_max_new_tokens: int = MIXED_BATCH_MAX_NEW_TOKENS,
 ) -> list[dict]:
     """Run every (policy, concurrency) combination, restarting the server once
     per policy, repeating each combination `repeats` times and keeping the
@@ -413,7 +463,9 @@ async def sweep(
                 print(f"  policy={policy} concurrency={concurrency} requests={cell_requests} repeats={cell_repeats}")
                 repeat_rows = []
                 for _ in range(cell_repeats):
-                    result = await run_fn(policy, concurrency, cell_requests, max_new_tokens)
+                    result = await run_fn(
+                        policy, concurrency, cell_requests, max_new_tokens, workload, mixed_batch_max_new_tokens
+                    )
                     repeat_rows.append(result.to_row())
 
                 row = _median_row(repeat_rows)
@@ -465,7 +517,21 @@ def main() -> None:
         help="virtual = N workers looping send/await/send-next (default); "
         "burst = all requests created at once, gated by a semaphore",
     )
-    parser.add_argument("--max-new-tokens", type=int, default=32, help="max_new_tokens per request")
+    parser.add_argument("--max-new-tokens", type=int, default=32, help="max_new_tokens per request (uniform workload only)")
+    parser.add_argument(
+        "--workload",
+        choices=["uniform", "mixed"],
+        default="uniform",
+        help="uniform (default) = every request gets --max-new-tokens, unchanged original behavior; "
+        "mixed = interactive requests stay short (32 tokens), batch requests go long "
+        "(--mixed-batch-max-new-tokens), so there's a long generation for a short one to get trapped behind",
+    )
+    parser.add_argument(
+        "--mixed-batch-max-new-tokens",
+        type=int,
+        default=MIXED_BATCH_MAX_NEW_TOKENS,
+        help="Batch-class max_new_tokens under --workload mixed (trim target if runtime is too long)",
+    )
     parser.add_argument("--output", "-o", default="results.csv", help="CSV output path")
     args = parser.parse_args()
 
@@ -477,7 +543,8 @@ def main() -> None:
         f"Sweeping {len(policies)} policies x {len(concurrencies)} concurrency levels "
         f"({args.repeats} repeats each at {args.requests} requests, except concurrency=1: "
         f"{args.concurrency_1_repeats} repeat(s) at {args.concurrency_1_requests} requests, "
-        f"load_model={args.load_model}) -> {output_path} (written incrementally, one row per cell)"
+        f"load_model={args.load_model}, workload={args.workload}) -> {output_path} "
+        f"(written incrementally, one row per cell)"
     )
 
     init_csv(output_path)
@@ -492,6 +559,8 @@ def main() -> None:
             args.concurrency_1_requests,
             args.concurrency_1_repeats,
             output_path,
+            args.workload,
+            args.mixed_batch_max_new_tokens,
         )
     )
 
